@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import re
 
 import torch
@@ -25,6 +26,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 from ...compressor.qat.modules.quantizer import fp8_cast_ste
 from ...compressor.quant.core import PTQSaveVllmHF
 from ...utils.utils import find_layers, find_parent_layer_and_sub_name, print_info
+from ...utils.zero3_utils import gathered_params_if_zero3, is_zero3_param
 from ..base_model import BaseLLMModel
 from ..model_factory import SlimModelFactory
 
@@ -32,24 +34,76 @@ from ..model_factory import SlimModelFactory
 class QwenMoeExpertsWithLinear(Qwen3MoeExperts):
 
     def __init__(self, experts_layer):
-        super().__init__(experts_layer.config)
-        self.gate_up_proj = experts_layer.gate_up_proj
-        self.down_proj = experts_layer.down_proj
+        # NOTE: We deliberately SKIP ``Qwen3MoeExperts.__init__`` because it
+        # would allocate two large dense parameters (``gate_up_proj`` /
+        # ``down_proj`` of shape ``[num_experts, ...]``) which are wasteful
+        # under ZeRO-3: we will replace them with per-expert ``nn.Linear``
+        # modules anyway. For large MoE models (Qwen3-30B-A3B, ~1.2GB per
+        # layer) skipping this allocation is critical to keep peak memory
+        # bounded.
+        nn.Module.__init__(self)
+        cfg = experts_layer.config
+        self.num_experts = experts_layer.num_experts
+        self.hidden_dim = experts_layer.hidden_dim
+        self.intermediate_dim = experts_layer.intermediate_dim
+        self.act_fn = experts_layer.act_fn
+        self.config = cfg
+
+        # Determine dtype/device from the existing parameters (they may be
+        # ZeRO-3 shards; callers must ensure a GatheredParameters context is
+        # active before constructing this module).
+        gate_up = experts_layer.gate_up_proj
+        down = experts_layer.down_proj
+        dtype = gate_up.dtype
+        # Prefer the gathered tensor's device; fall back to current cuda.
+        device = (
+            gate_up.device
+            if gate_up.device.type != "meta"
+            else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        )
+
         for expert_idx in range(self.num_experts):
+            # Slice out this expert's weights from the gathered dense
+            # parameters. ``.chunk`` returns views; ``copy_`` materialises
+            # them into freshly-allocated per-expert Linears.
+            gate_w, up_w = gate_up[expert_idx].chunk(2, dim=-2)
+            down_w = down[expert_idx]
+
             expert = nn.ModuleDict(
                 {
-                    "gate_proj": nn.Linear(self.hidden_dim, self.intermediate_dim, bias=False),
-                    "up_proj": nn.Linear(self.hidden_dim, self.intermediate_dim, bias=False),
-                    "down_proj": nn.Linear(self.intermediate_dim, self.hidden_dim, bias=False),
+                    "gate_proj": nn.Linear(
+                        self.hidden_dim,
+                        self.intermediate_dim,
+                        bias=False,
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "up_proj": nn.Linear(
+                        self.hidden_dim,
+                        self.intermediate_dim,
+                        bias=False,
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "down_proj": nn.Linear(
+                        self.intermediate_dim,
+                        self.hidden_dim,
+                        bias=False,
+                        dtype=dtype,
+                        device=device,
+                    ),
                 }
             )
-            expert["gate_proj"].weight.data, expert["up_proj"].weight.data = self.gate_up_proj[
-                expert_idx
-            ].chunk(2, dim=-2)
-            expert["down_proj"].weight.data = self.down_proj[expert_idx]
+            with torch.no_grad():
+                expert["gate_proj"].weight.data.copy_(gate_w)
+                expert["up_proj"].weight.data.copy_(up_w)
+                expert["down_proj"].weight.data.copy_(down_w)
             setattr(self, f"{expert_idx}", expert)
-        del self.gate_up_proj
-        del self.down_proj
+
+            # Immediately drop slice views so memory is freed at the end of
+            # the iteration (they alias the gathered tensor but the new
+            # Linears now own independent copies).
+            del gate_w, up_w, down_w, expert
 
     def forward(
         self,
@@ -107,16 +161,199 @@ class Qwen(BaseLLMModel):
             "down_proj",
         ]
 
+    # ------------------------------------------------------------------
+    # ZeRO-3 aware ``from_pretrained``
+    # ------------------------------------------------------------------
+    #
+    # Background
+    # ----------
+    # HuggingFace ``transformers`` (tested on v5.2) takes a disastrous
+    # fast path for ZeRO-3 inside ``_load_pretrained_model``::
+    #
+    #     if is_deepspeed_zero3_enabled() and not is_quantized:
+    #         merged_state_dict = {}
+    #         for ckpt_file in checkpoint_files:
+    #             merged_state_dict.update(
+    #                 load_state_dict(ckpt_file, map_location="cpu", ...)
+    #             )
+    #         state_dict = merged_state_dict
+    #
+    # i.e. EVERY rank builds a full CPU copy of the entire checkpoint
+    # before partitioning. For Qwen3-30B-A3B (~60GB in bf16), 8 ranks on
+    # one node peaks at ~480GB of host RAM before a single parameter is
+    # loaded -- matching the ~500GB OOM the user sees.
+    #
+    # Strategy here
+    # -------------
+    # Under ZeRO-3 we bypass HF's loader entirely:
+    #   1. Build an empty, sharded model via ``from_config`` inside
+    #      ``no_init_weights`` + ``deepspeed.zero.Init``.  Every parameter
+    #      is immediately partitioned; almost nothing on CPU.
+    #   2. Run :meth:`replace_moe` BEFORE loading weights. This rewires
+    #      the fused ``Qwen3MoeExperts(gate_up_proj, down_proj)`` into
+    #      per-expert ``nn.Linear``\\ s whose names ALREADY match the
+    #      checkpoint layout (``experts.{i}.{gate,up,down}_proj.weight``).
+    #      No fused-to-split conversion is needed on load.
+    #   3. Stream the checkpoint one safetensors shard at a time. For
+    #      each tensor, open a ``GatheredParameters([target],
+    #      modifier_rank=0)`` context, copy on rank 0, and exit to
+    #      rescatter. Peak host memory is bounded by a single shard
+    #      (~4-5GB), not the whole checkpoint.
+    #
+    # When ZeRO-3 is NOT active we fall back to the vanilla HF path, and
+    # ``replace_moe`` runs later (inside :meth:`init_ptq`) as before.
+    #
+    def from_pretrained(
+        self,
+        model_path,
+        torch_dtype="auto",
+        device_map="auto",
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+        use_cache=False,
+        using_multi_nodes=False,
+        attn_implementation="default",
+    ):
+        from transformers import AutoTokenizer
+        from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+
+        # Non ZeRO-3: keep HF's native loading path.
+        if not is_deepspeed_zero3_enabled():
+            return super().from_pretrained(
+                model_path,
+                torch_dtype=torch_dtype,
+                device_map=device_map,
+                trust_remote_code=trust_remote_code,
+                low_cpu_mem_usage=low_cpu_mem_usage,
+                use_cache=use_cache,
+                using_multi_nodes=using_multi_nodes,
+                attn_implementation=attn_implementation,
+            )
+
+        # ZeRO-3 streaming path.
+        print_info(
+            "[Qwen.from_pretrained] Detected DeepSpeed ZeRO-3: using "
+            "streaming shard loader to bound host memory."
+        )
+        self._zero3_streaming_from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=trust_remote_code,
+            use_cache=use_cache,
+            attn_implementation=attn_implementation,
+        )
+        # Tokenizer is tiny; load on every rank.
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
+
+    def _zero3_streaming_from_pretrained(
+        self,
+        model_path,
+        torch_dtype="auto",
+        trust_remote_code=True,
+        use_cache=False,
+        attn_implementation="default",
+    ):
+        """Build an empty ZeRO-3 model and stream weights one shard at a time.
+
+        Thin wrapper around :func:`angelslim.utils.zero3_streaming_from_pretrained`
+        that passes :meth:`replace_moe` as the pre-load hook. The MoE
+        rewiring must happen *before* the shard stream so that the live
+        parameter names (``...experts.{i}.{gate,up,down}_proj.weight``)
+        already match the checkpoint's per-expert layout, making the load
+        a pure name-to-name copy with no fused-to-split conversion on the
+        critical path.
+        """
+        from ...utils import zero3_streaming_from_pretrained
+
+        def _prepare(_model):
+            # ``self.model`` must be set before ``replace_moe`` runs since
+            # it walks ``self.model.named_modules()``.
+            self.model = _model
+            self.replace_moe()
+
+        self.model = zero3_streaming_from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=trust_remote_code,
+            use_cache=use_cache,
+            attn_implementation=attn_implementation,
+            prepare_fn=_prepare,
+            log_prefix="[Qwen.from_pretrained]",
+        )
+
     def replace_moe(self):
-        for name, module in self.model.named_modules():
-            if isinstance(module, Qwen3MoeExperts) and not isinstance(
-                module, QwenMoeExpertsWithLinear
-            ):
-                print(name)
-                parent_layer, sub_name = find_parent_layer_and_sub_name(self.model, name)
-                moe_linear = QwenMoeExpertsWithLinear(module)
-                del module
-                setattr(parent_layer, sub_name, moe_linear)
+        """Replace every ``Qwen3MoeExperts`` with ``QwenMoeExpertsWithLinear``.
+
+        ZeRO-3 aware:
+          * If the original experts parameters (``gate_up_proj`` /
+            ``down_proj``) are ZeRO-3 shards, we gather them for just the
+            current layer, build the per-expert Linears from the full
+            tensors, and immediately partition the newly-created Linear
+            weights via ``deepspeed.zero.Init(module=...)``.
+          * After each layer we drop references to the old experts module
+            and call ``gc.collect`` + ``torch.cuda.empty_cache`` so that
+            the peak resident footprint stays bounded to roughly one MoE
+            layer's worth of parameters.
+          * If ZeRO-3 is not active, this degrades to the original plain
+            replacement path.
+        """
+        # Snapshot target layer names first so mutation doesn't disturb the
+        # iteration.
+        target_names = [
+            name
+            for name, module in self.model.named_modules()
+            if isinstance(module, Qwen3MoeExperts)
+            and not isinstance(module, QwenMoeExpertsWithLinear)
+        ]
+
+        for name in target_names:
+            print(name)
+            self._replace_one_moe_layer(name)
+            # Drop stale cuda caching allocator blocks / host refs between
+            # layers so the next layer starts from a clean slate.
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _replace_one_moe_layer(self, name):
+        """Replace a single MoE experts module with per-layer peak-memory
+        control. See :meth:`replace_moe` for the high-level contract."""
+        parent_layer, sub_name = find_parent_layer_and_sub_name(self.model, name)
+        old_experts = getattr(parent_layer, sub_name)
+
+        # Detect ZeRO-3 shards on the original parameters.
+        z3 = is_zero3_param(old_experts.gate_up_proj) or is_zero3_param(
+            old_experts.down_proj
+        )
+
+        # Gather the ONE layer's experts params, build the new module while
+        # gathered so per-expert slicing sees full tensors, then release.
+        with gathered_params_if_zero3(
+            [old_experts.gate_up_proj, old_experts.down_proj],
+            modifier_rank=None,
+        ):
+            moe_linear = QwenMoeExpertsWithLinear(old_experts)
+
+        # Attach the new module and drop all references to the old experts
+        # (including ZeRO-3 hook metadata) before any subsequent work.
+        setattr(parent_layer, sub_name, moe_linear)
+        del old_experts
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Under ZeRO-3 the freshly-created per-expert Linear weights are
+        # still full (every rank holds a complete copy). Partition them
+        # in-place so each rank only retains its 1/N shard.
+        if z3:
+            from ...utils.lazy_imports import deepspeed
+
+            deepspeed.zero.Init(module=moe_linear)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def init_ptq(self, slim_config):
         self.replace_moe()

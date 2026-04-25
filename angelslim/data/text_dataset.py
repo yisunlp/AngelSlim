@@ -111,6 +111,101 @@ class TextDataset(BaseDataset):
             }
             self.data.append(data_item)
 
+    # Chat-template role markers used to locate the last assistant turn so
+    # that only its content participates in the loss. Covers hunyuan
+    # (``<｜hy_*｜>``) and qwen / chatml (``<|im_*|>``) families.
+    _ASSISTANT_HEADERS = (
+        "<｜hy_Assistant｜>",
+        "<|im_start|>assistant\n",
+        "<|im_start|>assistant",
+        "<|assistant|>",
+    )
+    _TURN_END_MARKERS = (
+        "<｜hy_place▁holder▁no▁2｜>",
+        "<eos:6124c78e>",
+        "<|im_end|>",
+        "<|endoftext|>",
+    )
+
+    def _find_last_assistant_span(self, text: str):
+        """Return ``(start, end)`` char offsets of the LAST assistant content,
+        or ``None`` if no assistant header is present."""
+        header_used, header_pos = None, -1
+        for header in self._ASSISTANT_HEADERS:
+            pos = text.rfind(header)
+            if pos > header_pos:
+                header_pos, header_used = pos, header
+        if header_pos < 0:
+            return None
+
+        content_start = header_pos + len(header_used)
+        # Include the turn-end marker so the model learns to emit it.
+        content_end = len(text)
+        for end_marker in self._TURN_END_MARKERS:
+            pos = text.find(end_marker, content_start)
+            if pos >= 0:
+                stop = pos + len(end_marker)
+                if stop < content_end:
+                    content_end = stop
+        return content_start, content_end
+
+    def _build_content_mask(self, text: str, tokenized) -> List[int]:
+        """Per-token 0/1 mask: 1 on tokens of the LAST assistant content.
+
+        Falls back to all-ones if offsets are unavailable or no header is
+        found (i.e. train on the whole sequence, legacy behaviour).
+        """
+        seq_len = int(tokenized["input_ids"].shape[-1])
+        span = self._find_last_assistant_span(text)
+        offsets = tokenized.get("offset_mapping")
+        if span is None or offsets is None:
+            return [1] * seq_len
+
+        content_start, content_end = span
+        offsets = offsets[0].tolist() if hasattr(offsets[0], "tolist") else list(offsets[0])
+        mask = [0] * seq_len
+        for i, (s, e) in enumerate(offsets):
+            if s == e:  # special token
+                continue
+            if s >= content_start and e <= content_end:
+                mask[i] = 1
+        return mask
+
+    def _process_text(self, text: str) -> None:
+        """Tokenise ``text`` (chat-template already applied) into
+        ``input_ids`` / ``attention_mask`` / ``labels`` / ``loss_mask``. Only
+        the LAST assistant segment contributes to the loss."""
+        model_inputs = self.processor(
+            text=[text],
+            return_tensors="pt",
+            max_length=self.max_length,
+            truncation=True,
+            padding="max_length",
+            return_offsets_mapping=True,
+        )
+        content_mask = torch.tensor(
+            self._build_content_mask(text, model_inputs), dtype=torch.long
+        ).unsqueeze(0)
+        model_inputs.pop("offset_mapping", None)
+
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        # Next-token prediction: shift labels and mask by one.
+        labels = input_ids.roll(shifts=-1, dims=-1)
+        labels[:, -1] = -100
+        loss_mask = content_mask.roll(shifts=-1, dims=-1)
+        loss_mask[:, -1] = 0
+        loss_mask = loss_mask * attention_mask  # drop padding positions
+
+        self.data.append(
+            {
+                "input_ids": input_ids.to(self.device),
+                "attention_mask": attention_mask.to(self.device),
+                "labels": labels.to(self.device),
+                "loss_mask": loss_mask.to(self.device),
+            }
+        )
+
     def _load_jsonl_data(self, data_path: str, num_samples: int):
         line_count = 0
         with open(data_path, "r") as f:
@@ -119,18 +214,28 @@ class TextDataset(BaseDataset):
                     break
 
                 data = json.loads(line)
-
-                # Validate format
                 assert (
-                    "messages" in data or "input" in data or "conversations" in data
+                    "messages" in data
+                    or "input" in data
+                    or "conversations" in data
+                    or "applied_message" in data
                 ), "JSON format error"
 
-                # Prepare messages
-                messages = self._prepare_messages(data)
+                # Pre-rendered chat string — use as-is.
+                if "applied_message" in data:
+                    self._process_text(data["applied_message"])
+                    line_count += 1
+                    continue
 
-                # Apply chat template
+                # Structured messages — render via chat template. Use
+                # ``add_generation_prompt=False`` so the rendered text ends
+                # with the last assistant's actual content (plus its turn-end
+                # marker); otherwise the template appends an empty assistant
+                # header and ``_find_last_assistant_span`` would pick up that
+                # empty span, producing an all-zero loss_mask.
+                messages = self._prepare_messages(data)
                 text = self.processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                    messages, tokenize=False, add_generation_prompt=False
                 )
 
                 thinking_data = False
@@ -149,25 +254,7 @@ class TextDataset(BaseDataset):
                         elif dic["role"] == "assistant":
                             text = text + dic["content"] + self.processor.eos_token
 
-                model_inputs = self.processor(
-                    text=[text],
-                    return_tensors="pt",
-                    max_length=self.max_length,
-                    truncation=True,
-                    padding="max_length",
-                )
-
-                labels = model_inputs["input_ids"].roll(shifts=-1, dims=-1)
-                labels[:, -1] = -100
-
-                self.data.append(
-                    {
-                        "input_ids": model_inputs["input_ids"].to(self.device),
-                        "attention_mask": model_inputs["attention_mask"].to(self.device),
-                        "labels": labels.to(self.device),
-                    }
-                )
-
+                self._process_text(text)
                 line_count += 1
 
     def _prepare_messages(self, data: Dict) -> List[Dict]:

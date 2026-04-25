@@ -101,6 +101,16 @@ class Engine:
         assert model_name, "model_name must be specified."
         assert model_path, "model_path must be specified."
 
+        # Normalize device_map for DeepSpeed ZeRO / distributed training:
+        # YAML configs often use ``None`` / the string ``"None"`` / ``"distributed"``
+        # to mean "no pre-placement, let DeepSpeed shard", but HF only accepts
+        # Python ``None`` there.
+        if isinstance(device_map, str) and device_map.lower() in (
+            "none",
+            "distributed",
+        ):
+            device_map = None
+
         # Initialize slim model by ModelFactory
         self.slim_model = SlimModelFactory.create(
             model_name, model=model, deploy_backend=deploy_backend

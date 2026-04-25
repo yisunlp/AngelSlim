@@ -18,6 +18,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ....utils import gathered_param_if_zero3
+
 FP8_E4M3_QMIN = -448
 FP8_E4M3_QMAX = 448
 
@@ -68,8 +70,10 @@ class Quantizer(nn.Module):
 
         self._apply_settings(info, rewrite_conf)
         self._set_quant_range()
-        self._init_quant_params(x)
-        self._init_lwc_params(x, config)
+        # ZeRO-3 may shard ``x``; gather it once for scale/LWC initialization.
+        with gathered_param_if_zero3(x):
+            self._init_quant_params(x)
+            self._init_lwc_params(x, config)
 
     def _apply_settings(self, info, rewrite_conf):
         if rewrite_conf:
@@ -218,7 +222,6 @@ class Quantizer(nn.Module):
 
         else:
             raise ValueError(f"Unsupported granularity: {granularity}")
-
         return s / self.qmax
 
     def _compute_scales_and_zero_points(self, x, granularity="per-tensor", group_size=-1):
@@ -531,9 +534,6 @@ class QuantLinear(nn.Module):
             )
 
     def forward(self, input: torch.Tensor):
-        if input.shape[0] == 0:
-            return self.fwd_func(input, self.weight, self.bias)
-
         weight = self.weight_quantizer(self.weight) if self.use_weight_quant else self.weight
         if self.use_act_quant:
             input = self.act_quantizer(input)

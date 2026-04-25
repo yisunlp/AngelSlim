@@ -1,0 +1,88 @@
+global:
+  save_path: ./output
+
+model:
+  name: HYV3MoE
+  model_path: /apdcephfs_zwfy2/share_301053287/brunosu/all_models/hy3_0_a3b
+  trust_remote_code: true
+  torch_dtype: auto
+  device_map: None
+  low_cpu_mem_usage: true
+  use_cache: false
+
+compression:
+  name: QAT
+  quantization:
+    name: fp8_static
+    bits: 8
+    quant_method:
+      weight: per-tensor
+      activation: per-tensor
+      group_size: -1
+    ignore_layers: ["lm_head", "embed_tokens", "gate.weight"] # Skip quantization for these layers
+  QAT:
+    # hf_dataset: Salesforce/wikitext,wikitext-2-raw-v1 # hf dataset name; when set, overrides dataset.data_path below
+    # hf_cache_dir: Specify your cache path, or not set(default)
+    from_ptq_ckpt: /apdcephfs_zwfy2/share_301053287/brunosu/all_models/scales # Load ptq checkpoint for scale init
+    training_mode: end2end
+    dist_mode: hf # "hf" is using HF Trainer
+    save_format: real # Set "fake" or "real", or not set(skip save)
+    do_train: true
+    # resume_ckpt_dir: Resume for fake checkpoint, when save_format=='fake', or not set
+    loss_type: origin # origin | kl | rkl | mse | kd | kl_top[_K] | r_kl_top[_K]
+    loss_topk: null # optional, overrides the K parsed from loss_type
+    kd_temperature: 1.0
+    kd_alpha: 0.5
+    plugin_config:
+      enable_scale: true
+      quant_config:
+        use_weight_quant: true
+        use_activation_quant: true
+        use_qkv_quant: false
+        lazy_init_samples: 3
+        # When true, skip the activation-scale calibration forward entirely
+        # and initialize every static quantizer with scale=1.0. Recommended
+        # for DeepSpeed ZeRO-3 runs where the calibration forward would have
+        # to run on CPU (sharded weights, no DeepSpeedEngine yet) and be
+        # prohibitively slow. Because activation scales are ``learnable``,
+        # they will be fitted during QAT training itself.
+        skip_lazy_init: true
+        # --- Learnable parameter control ---
+        # Each switch independently controls whether that parameter group is trainable.
+        # Model weights themselves always stay frozen.
+        learnable:
+          act_scale: true             # Activation quantizer scale/zero_point (default: false)
+          weight_scale: true          # Weight quantizer scale/zero_point (default: true)
+          kv_scale: false             # KV cache quantizer scale in k_proj/v_proj (default: false)
+          norm: false                 # Norm layer (RMSNorm/LayerNorm) weights (default: false)
+          lwc: true                  # LWC quantization (default: false)
+          lwc:
+            enable_lwc: true
+            lwc_init_value: 4.0
+            lwc_lr: 0.2 # default 0.5, can be set to 0.2
+    hf_args:
+      # output_dir: Not to set, same as global.save_path
+      # other arguments, see https://huggingface.co/docs/transformers/v5.1.0/en/main_classes/trainer#transformers.Seq2SeqTrainingArguments
+      logging_steps: 1
+      logging_first_step: true
+      per_device_train_batch_size: 1
+      gradient_accumulation_steps: 1
+      learning_rate: 1.0e-4
+      lr_scheduler_type: cosine
+      num_train_epochs: 1
+      save_strategy: 'no'
+      warmup_ratio: 0.0
+      max_grad_norm: 1.0   # global grad-norm clip (set 0 to disable)
+      # weight_decay: 0.001
+      gradient_checkpointing: true
+      deepspeed: configs/qwen3/qat/fp8_static/learn_scale/ds_config.json
+      gradient_checkpointing_kwargs:
+        use_reentrant: true
+
+dataset:
+  name: TextDataset
+  data_path: ./dataset/sharegpt_gpt4_qwen/sharegpt_gpt4-qwen3_a22B_output.jsonl
+  max_seq_length: 1024
+  num_samples: 256
+  batch_size: 1
+

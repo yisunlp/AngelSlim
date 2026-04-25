@@ -50,19 +50,32 @@ class QATDataset(IterableDataset):
             for k, t in concatenated.items()
         }
         result["labels"] = result["input_ids"].copy()
+        # Plain text corpus (e.g. wikitext): every token is a valid target.
         return [
-            {"input_ids": result["input_ids"][i], "labels": result["labels"][i]}
+            {
+                "input_ids": result["input_ids"][i],
+                "labels": result["labels"][i],
+                "loss_mask": [1] * len(result["input_ids"][i]),
+            }
             for i in range(len(result["input_ids"]))
         ]
 
     def _build_from_internal(self, dataset):
-        return [
-            {
-                "input_ids": dataset[i]["input_ids"].tolist()[0],
-                "labels": dataset[i]["labels"].tolist()[0],
+        built = []
+        for i in range(len(dataset)):
+            item = dataset[i]
+            entry = {
+                "input_ids": item["input_ids"].tolist()[0],
+                "labels": item["labels"].tolist()[0],
             }
-            for i in range(len(dataset))
-        ]
+            # Upstream ``TextDataset`` emits loss_mask; fall back to all-ones
+            # for legacy callers.
+            if "loss_mask" in item:
+                entry["loss_mask"] = item["loss_mask"].tolist()[0]
+            else:
+                entry["loss_mask"] = [1] * len(entry["input_ids"])
+            built.append(entry)
+        return built
 
 
 class BlockTrainDataset(Dataset):

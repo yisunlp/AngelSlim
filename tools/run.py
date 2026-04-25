@@ -267,6 +267,35 @@ def weight_only_run(config):
         )
 
 
+def _prewarm_hf_deepspeed_config(config):
+    """Pre-construct ``Seq2SeqTrainingArguments`` so its DeepSpeed weak-ref is
+    registered BEFORE ``from_pretrained`` runs.
+
+    This is what triggers HF's ``AutoModelForCausalLM.from_pretrained`` to use
+    ``deepspeed.zero.Init`` for sharded allocation, making loading of large
+    models (e.g. Qwen3-30B-A3B) feasible. No-op for non-QAT configs or when
+    ``hf_args.deepspeed`` is not set.
+    """
+    compress_cfg = getattr(config, "compression_config", None)
+    if compress_cfg is None:
+        return None
+    qat_cfg = getattr(compress_cfg, "QAT", None)
+    if qat_cfg is None:
+        return None
+    hf_args = getattr(qat_cfg, "hf_args", None)
+    from transformers import Seq2SeqTrainingArguments
+
+    trainer_args=Seq2SeqTrainingArguments(
+        output_dir=config.global_config.save_path,
+        **hf_args,
+    )
+    print_info(
+        "[DeepSpeed pre-warm] HfTrainerDeepSpeedConfig registered; "
+        "from_pretrained will use deepspeed.zero.Init."
+    )
+    return trainer_args
+
+
 def run(config):
     """
     Run the LLM compression process based on the provided configuration.
@@ -295,6 +324,10 @@ def run(config):
         weight_only_run(config)
         return
 
+    # QAT + DeepSpeed: register HfTrainerDeepSpeedConfig BEFORE loading the
+    # model so that ``from_pretrained`` uses ``deepspeed.zero.Init`` for
+    # sharded allocation. No-op otherwise.
+    trainer_config=_prewarm_hf_deepspeed_config(config)
     # Step 2: Execute complete pipeline
     slim_engine = Engine()
 

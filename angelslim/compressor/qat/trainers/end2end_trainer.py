@@ -15,7 +15,7 @@
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
+from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, default_data_collator
 
 from ....data.qat_dataset import QATDataset
 from ....utils import print_info
@@ -37,6 +37,17 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
         self.use_qkv_quant = quant_config.get("use_qkv_quant", False)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # ``loss_mask`` is produced by our dataset (see text_dataset.py) and
+        # marks which label positions belong to the assistant reply we train
+        # on. It is NOT a model argument; pop it out before forwarding and
+        # turn masked-out positions into -100 so HF CE / our KL both ignore
+        # them.
+        loss_mask = inputs.pop("loss_mask", None)
+        if loss_mask is not None and "labels" in inputs:
+            labels = inputs["labels"]
+            loss_mask = loss_mask.to(labels.device).view_as(labels)
+            inputs["labels"] = labels.masked_fill(loss_mask == 0, -100)
+
         if self.loss_type == "origin":
             return super().compute_loss(
                 model,
@@ -52,52 +63,64 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
         outputs = model(**student_inputs)
         student_logits = outputs.logits
 
+        # Flat per-token mask for KL/MSE: re-use labels (-100 = ignore).
+        flat_mask = None
+        if "labels" in inputs:
+            flat_mask = (inputs["labels"] != -100).reshape(-1)
+
+        def _masked_kl(log_p_src, p_tgt):
+            kl_per_tok = F.kl_div(log_p_src, p_tgt, reduction="none").sum(dim=-1)
+            if flat_mask is not None:
+                kl_per_tok = kl_per_tok[flat_mask]
+            if kl_per_tok.numel() == 0:
+                return kl_per_tok.sum()  # 0.0 but keeps the graph
+            return kl_per_tok.mean()
+
         if self.loss_type == "kl":
-            loss = F.kl_div(
+            loss = _masked_kl(
                 F.log_softmax(student_logits.flatten(0, -2), dim=-1),
                 F.softmax(teacher_logits.flatten(0, -2), dim=-1),
-                reduction="batchmean",
             )
         elif self.loss_type == "rkl":
-            loss = F.kl_div(
+            loss = _masked_kl(
                 F.log_softmax(teacher_logits.flatten(0, -2), dim=-1),
                 F.softmax(student_logits.flatten(0, -2), dim=-1),
-                reduction="batchmean",
             )
         elif self.loss_type == "mse":
-            loss = F.mse_loss(student_logits, teacher_logits)
+            if flat_mask is not None:
+                s = student_logits.flatten(0, -2)[flat_mask]
+                t = teacher_logits.flatten(0, -2)[flat_mask]
+                loss = F.mse_loss(s, t) if s.numel() > 0 else s.sum()
+            else:
+                loss = F.mse_loss(student_logits, teacher_logits)
         elif self.loss_type == "kd":
             if getattr(outputs, "loss", None) is None:
                 raise ValueError("loss_type='kd' requires labels to compute CE loss.")
             temperature = max(self.kd_temperature, 1e-6)
             alpha = self.kd_alpha
-            distill_loss = F.kl_div(
+            distill_loss = _masked_kl(
                 F.log_softmax(student_logits.flatten(0, -2) / temperature, dim=-1),
                 F.softmax(teacher_logits.flatten(0, -2) / temperature, dim=-1),
-                reduction="batchmean",
             )
             loss = outputs.loss * (1 - alpha) + distill_loss * (alpha * temperature * temperature)
         elif self._is_reverse_topk_loss(self.loss_type):
             topk = self._resolve_topk(self.loss_type, student_logits.size(-1))
             top_student_logits, indices = student_logits.topk(topk, dim=-1, sorted=False)
             top_teacher_logits = teacher_logits.gather(-1, indices)
-            loss = F.kl_div(
+            loss = _masked_kl(
                 F.log_softmax(top_teacher_logits.flatten(0, -2), dim=-1),
                 F.softmax(top_student_logits.flatten(0, -2), dim=-1),
-                reduction="batchmean",
             )
         elif self._is_forward_topk_loss(self.loss_type):
             topk = self._resolve_topk(self.loss_type, teacher_logits.size(-1))
             top_teacher_logits, indices = teacher_logits.topk(topk, dim=-1, sorted=False)
             top_student_logits = student_logits.gather(-1, indices)
-            loss = F.kl_div(
+            loss = _masked_kl(
                 F.log_softmax(top_student_logits.flatten(0, -2), dim=-1),
                 F.softmax(top_teacher_logits.flatten(0, -2), dim=-1),
-                reduction="batchmean",
             )
         else:
             raise ValueError(f"Unsupported QAT loss_type: {self.loss_type}")
-
         return (loss, outputs) if return_outputs else loss
 
     @staticmethod
@@ -222,15 +245,23 @@ class End2EndTrainer:
             return
         if self.training_mode == "end2end" and self.dist_mode == "hf":
             self._init_optimizer()
+            # Force-disable ``remove_unused_columns`` so HF Trainer does NOT
+            # filter out our custom ``loss_mask`` key based on the model's
+            # forward signature. Also pin the data_collator so
+            # DataCollatorForSeq2Seq (which calls tokenizer.pad and drops
+            # unknown keys) is not used.
+            hf_args = dict(self.config["compress_config"].QAT.hf_args)
+            hf_args["remove_unused_columns"] = False
             self.external_trainer = QATSeq2SeqTrainer(
                 model=self.quant_model.model,
                 processing_class=self.quant_model.tokenizer,
                 args=Seq2SeqTrainingArguments(
                     output_dir=self.config["global_config"].save_path,
-                    **self.config["compress_config"].QAT.hf_args,
+                    **hf_args,
                 ),
                 train_dataset=self.train_dataset,
                 eval_dataset=None,
+                data_collator=default_data_collator,
                 optimizers=(self.optimizer, None),
                 loss_config=self.loss_config,
                 quant_config=self.quant_config,

@@ -272,6 +272,12 @@ class QATTrainingConfig:
     hf_dataset: Optional[str] = None
     do_train: bool = field(default=True)
     resume_ckpt_dir: Optional[str] = None
+    # Optional warm-start directory (a previous ``save_fmt="real"`` output).
+    # When set, scales / zero_points / kv-cache scales are loaded from this
+    # directory into the freshly-created ``QuantLinear`` quantizers; base
+    # ``Linear`` weights still come from ``model.model_path``. Orthogonal to
+    # ``resume_ckpt_dir`` (which reloads a full state_dict).
+    from_ptq_ckpt: Optional[str] = None
     loss_type: str = field(default="origin")
     loss_topk: Optional[int] = None
     kd_temperature: float = field(default=1.0)
