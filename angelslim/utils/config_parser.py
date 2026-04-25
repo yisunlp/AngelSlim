@@ -272,6 +272,8 @@ class QATTrainingConfig:
     hf_dataset: Optional[str] = None
     do_train: bool = field(default=True)
     resume_ckpt_dir: Optional[str] = None
+    from_ptq_ckpt: Optional[str] = None
+    require_external_scales_for_zero3: bool = field(default=True)
     loss_type: str = field(default="origin")
     loss_topk: Optional[int] = None
     kd_temperature: float = field(default=1.0)

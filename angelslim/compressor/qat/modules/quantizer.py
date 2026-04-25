@@ -18,6 +18,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ....utils import is_deepspeed_zero3_enabled
+
 FP8_E4M3_QMIN = -448
 FP8_E4M3_QMAX = 448
 
@@ -53,6 +55,9 @@ class Quantizer(nn.Module):
         super().__init__()
         self.is_act = is_act
         self.num_heads = num_heads
+        self.default_scale_value = float(
+            config.get("activation_scale_init_value" if is_act else "weight_scale_init_value", 1.0)
+        )
         info = quant_info.quant_algo_info["w"]
         self.group_size = quant_info.quant_algo_info.get("w_group_size", -1)
         rewrite_conf = config.get("weight", {})
@@ -117,8 +122,14 @@ class Quantizer(nn.Module):
                 self.scale = self.zero_point = None
                 if self.resume:
                     self.init = True
-                    zp = torch.empty(1) if not self.is_sym else None
-                    self._set_quant_parameters(torch.empty(1), zp)
+                    zp = self._default_zero_point((1,), None) if not self.is_sym else None
+                    self._set_quant_parameters(self._default_scale((1,), None), zp)
+                return
+
+            if is_deepspeed_zero3_enabled():
+                scale_shape = self._default_weight_scale_shape(x)
+                zp = self._default_zero_point(scale_shape, x) if not self.is_sym else None
+                self._set_quant_parameters(self._default_scale(scale_shape, x), zp)
                 return
 
             if self.is_sym:
@@ -141,11 +152,7 @@ class Quantizer(nn.Module):
             self.lwc_init_value = 4.0
 
         if self.lwc:
-            if x.dim() != 2:
-                x_for_shape = x.flatten(1)
-            else:
-                x_for_shape = x
-            out_dim, in_dim = x_for_shape.shape
+            out_dim, in_dim = self._weight_2d_shape(x)
             if self.granularity == "per-group":
                 if not self.group_size or self.group_size <= 0:
                     raise ValueError("per-group quantization requires positive group_size.")
@@ -157,12 +164,41 @@ class Quantizer(nn.Module):
             else:
                 dim1 = 1
 
+            device = x.device if x is not None and x.device.type != "meta" else torch.device("cpu")
             init = (
-                torch.ones((dim1, 1), device=x.device, dtype=torch.float32) * self.lwc_init_value
+                torch.ones((dim1, 1), device=device, dtype=torch.float32) * self.lwc_init_value
             )
             self.clip_factor_w_max = nn.Parameter(init.clone(), requires_grad=True)
             self.clip_factor_w_min = nn.Parameter(init.clone(), requires_grad=True)
             self.sigmoid = nn.Sigmoid()
+
+    def _weight_2d_shape(self, x):
+        shape = tuple(getattr(x, "ds_shape", tuple(x.shape)))
+        if len(shape) > 2:
+            return shape[0], int(torch.tensor(shape[1:]).prod().item())
+        return shape
+
+    def _default_weight_scale_shape(self, x):
+        out_dim, in_dim = self._weight_2d_shape(x)
+        if self.granularity == "per-channel":
+            return (out_dim, 1)
+        if self.granularity == "per-group":
+            if not self.group_size or self.group_size <= 0:
+                raise ValueError("per-group quantization requires positive group_size.")
+            if in_dim % self.group_size != 0:
+                raise ValueError(
+                    f"dim 1 ({in_dim}) not divisible by group_size ({self.group_size})"
+                )
+            return (out_dim, in_dim // self.group_size)
+        return (1,)
+
+    def _default_scale(self, shape, like):
+        device = like.device if like is not None and like.device.type != "meta" else torch.device("cpu")
+        return torch.full(shape, self.default_scale_value, dtype=torch.float32, device=device)
+
+    def _default_zero_point(self, shape, like):
+        device = like.device if like is not None and like.device.type != "meta" else torch.device("cpu")
+        return torch.zeros(shape, dtype=torch.float32, device=device)
 
     def _compute_scales(self, x, granularity="per-tensor", group_size=-1):
         if granularity == "per-tensor":

@@ -12,10 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
+import os
+
 import torch
+from safetensors import safe_open
 from tqdm import tqdm
 
-from ....utils import print_info, set_op_by_name
+from ....utils import (
+    gathered_param_if_zero3,
+    gathered_params_if_zero3,
+    is_deepspeed_zero3_enabled,
+    print_info,
+    set_op_by_name,
+)
 from ..modules.quantizer import QuantLinear
 from .base_plugin import BasePlugin
 from .plugin_manager import PluginManager
@@ -29,11 +39,21 @@ _QKV_PROJ_MAP = {
 
 @PluginManager.plugin("learnable_scale")
 class LearnableScalePlugin(BasePlugin):
-    def __init__(self, quant_info=None, ignore_layers=None, resume_ckpt_dir=None, **kwargs):
+    def __init__(
+        self,
+        quant_info=None,
+        ignore_layers=None,
+        resume_ckpt_dir=None,
+        from_ptq_ckpt_dir=None,
+        require_external_scales_for_zero3=True,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.quant_info = quant_info
         self.ignore_layers = ignore_layers
         self.resume_ckpt_dir = resume_ckpt_dir
+        self.from_ptq_ckpt_dir = from_ptq_ckpt_dir
+        self.require_external_scales_for_zero3 = require_external_scales_for_zero3
         self.use_weight_quant = self.config.get("use_weight_quant", False)
         self.use_activation_quant = self.config.get("use_activation_quant", False)
         self.fp8_attn = self.config.get("fp8_attn", False)
@@ -47,9 +67,22 @@ class LearnableScalePlugin(BasePlugin):
         self.learn_norm = learnable_cfg.get("norm", False)
 
     def before_train(self, **kwargs):
+        zero3 = is_deepspeed_zero3_enabled()
+        if zero3 and self.require_external_scales_for_zero3 and not self.from_ptq_ckpt_dir:
+            raise ValueError(
+                "DeepSpeed ZeRO3 QAT requires compression.QAT.from_ptq_ckpt "
+                "when require_external_scales_for_zero3=True."
+            )
+
         # Retrieve KV head count from model config for per-head quantization
         model_config = getattr(self.quant_model.model, "config", None)
         num_kv_heads = getattr(model_config, "num_key_value_heads", -1)
+        act_preallocate = (
+            self.resume_ckpt_dir is not None
+            or self.from_ptq_ckpt_dir is not None
+            or bool(self.config.get("skip_lazy_init", False))
+            or zero3
+        )
         for name, module in self.quant_model.model.named_modules():
             if isinstance(module, torch.nn.Linear):
                 if any(ig in name for ig in self.ignore_layers):
@@ -67,7 +100,7 @@ class LearnableScalePlugin(BasePlugin):
                     self.quant_info,
                     self.use_weight_quant,
                     self.use_activation_quant,
-                    resume=self.resume_ckpt_dir is not None,
+                    resume=act_preallocate,
                     qkv_config=qkv_cfg,
                 )
                 set_op_by_name(self.quant_model.model, name, q_linear)
@@ -78,14 +111,96 @@ class LearnableScalePlugin(BasePlugin):
 
         print_info(self.quant_model.model)
 
+        if self.from_ptq_ckpt_dir is not None:
+            self._load_from_ptq_ckpt(self.from_ptq_ckpt_dir)
+
         if (
             self.use_activation_quant
-            and not q_linear.act_quantizer.dynamic
             and self.resume_ckpt_dir is None
+            and not self.config.get("skip_lazy_init", False)
+            and not zero3
+            and self._needs_lazy_init()
         ):
             self._lazy_init(**kwargs)
 
         self._apply_learn_strategy()
+
+    def _needs_lazy_init(self):
+        for module in self.quant_model.model.modules():
+            if not isinstance(module, QuantLinear):
+                continue
+            if not hasattr(module, "act_quantizer"):
+                continue
+            quantizer = module.act_quantizer
+            if quantizer.dynamic:
+                continue
+            if not getattr(quantizer, "init", False):
+                return True
+        return False
+
+    def _load_from_ptq_ckpt(self, ckpt_dir):
+        ckpt_dir = self._resolve_scale_dir(ckpt_dir)
+        if ckpt_dir is None:
+            return
+
+        safetensor_files = sorted(glob.glob(os.path.join(ckpt_dir, "*.safetensors")))
+        if not safetensor_files:
+            print_info(f"[from_ptq_ckpt] no safetensors found in {ckpt_dir}, skip.")
+            return
+
+        named_modules = dict(self.quant_model.model.named_modules())
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        loaded = 0
+        skipped = 0
+
+        for src_file in safetensor_files:
+            with safe_open(src_file, framework="pt") as reader:
+                for key in reader.keys():
+                    parsed = _parse_scale_key(key)
+                    if parsed is None:
+                        continue
+                    layer_name, qname, sub = parsed
+                    targets = _expand_scale_targets(layer_name, qname, sub, named_modules)
+                    if not targets:
+                        skipped += 1
+                        continue
+                    src_tensor = reader.get_tensor(key) if rank == 0 else None
+                    for target_layer, target_qname, target_sub in targets:
+                        module = named_modules.get(target_layer)
+                        if not isinstance(module, QuantLinear):
+                            skipped += 1
+                            continue
+                        quantizer = getattr(module, target_qname, None)
+                        target = getattr(quantizer, target_sub, None) if quantizer else None
+                        if not isinstance(target, torch.nn.Parameter):
+                            skipped += 1
+                            continue
+                        if _copy_scale_tensor(src_tensor, target):
+                            loaded += 1
+                            if target_qname == "act_quantizer" and target_sub == "scale":
+                                quantizer.init = True
+                        else:
+                            skipped += 1
+
+        if rank == 0:
+            print_info(
+                f"[from_ptq_ckpt] loaded {loaded} scale tensor(s) from {ckpt_dir}; "
+                f"skipped {skipped}."
+            )
+
+    def _resolve_scale_dir(self, ckpt_dir):
+        if os.path.isdir(ckpt_dir):
+            nested = os.path.join(ckpt_dir, "final_quant_checkpoint")
+            if (
+                not glob.glob(os.path.join(ckpt_dir, "*.safetensors"))
+                and os.path.isdir(nested)
+            ):
+                return nested
+            return ckpt_dir
+        if self.require_external_scales_for_zero3 and is_deepspeed_zero3_enabled():
+            raise FileNotFoundError(f"from_ptq_ckpt not found: {ckpt_dir}")
+        print_info(f"[from_ptq_ckpt] directory not found, skip: {ckpt_dir}")
+        return None
 
     def _apply_learn_strategy(self):
         """Set requires_grad on parameters according to ``learnable`` config."""
@@ -229,9 +344,7 @@ def trainable_parameters(model):
     return iter(params)
 
 
-def _set_learnable_parameters(
-    model, act_scale=False, weight_scale=False, kv_scale=False, lwc=False
-):
+def _set_learnable_parameters(model, act_scale=False, weight_scale=False, kv_scale=False, lwc=False):
     _KV_SUFFIXES = ("k_proj", "v_proj")
 
     for name, module in model.named_modules():
@@ -285,4 +398,80 @@ def _get_qkv_config_for_layer(name, quant_config):
 def quant_inplace(model):
     for _, module in model.named_modules():
         if isinstance(module, QuantLinear):
-            module.weight.data = module.weight_quantizer(module.weight.data)
+            params = [module.weight]
+            if hasattr(module, "weight_quantizer"):
+                params.extend(module.weight_quantizer.parameters(recurse=True))
+            with gathered_params_if_zero3(params, modifier_rank=None):
+                module.weight.data = module.weight_quantizer(module.weight.data)
+
+
+def _parse_scale_key(key):
+    suffixes = [
+        (".weight_zero_point", "weight_quantizer", "zero_point"),
+        (".input_zero_point", "act_quantizer", "zero_point"),
+        (".weight_scale", "weight_quantizer", "scale"),
+        (".input_scale", "act_quantizer", "scale"),
+        (".k_cache.scale", "qkv_quantizer", "scale"),
+        (".v_cache.scale", "qkv_quantizer", "scale"),
+    ]
+    for suffix, qname, sub in suffixes:
+        if key.endswith(suffix):
+            layer_name = key[: -len(suffix)]
+            if suffix == ".k_cache.scale":
+                layer_name += ".k_proj"
+            elif suffix == ".v_cache.scale":
+                layer_name += ".v_proj"
+            return layer_name, qname, sub
+    return None
+
+
+def _expand_scale_targets(layer_name, qname, sub, named_modules):
+    if layer_name in named_modules:
+        return [(layer_name, qname, sub)]
+
+    if layer_name.endswith(".experts.gate_up_proj"):
+        base = layer_name[: -len(".gate_up_proj")]
+        targets = []
+        for name in named_modules:
+            if name.startswith(base + ".") and (
+                name.endswith(".gate_proj") or name.endswith(".up_proj")
+            ):
+                targets.append((name, qname, sub))
+        return targets
+
+    if layer_name.endswith(".experts.down_proj"):
+        base = layer_name[: -len(".down_proj")]
+        return [
+            (name, qname, sub)
+            for name in named_modules
+            if name.startswith(base + ".") and name.endswith(".down_proj")
+        ]
+
+    return []
+
+
+def _copy_scale_tensor(src_tensor, target):
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    ok = True
+    with gathered_param_if_zero3(target, modifier_rank=0):
+        if rank == 0:
+            src = src_tensor
+            if src.numel() == target.numel():
+                src = src.reshape(target.shape)
+            else:
+                try:
+                    src = src.expand_as(target).contiguous()
+                except RuntimeError:
+                    ok = False
+            if ok:
+                target.data.copy_(src.to(device=target.device, dtype=target.dtype))
+    if torch.distributed.is_initialized():
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else target.device
+        )
+        flag = torch.tensor(int(ok), device=device)
+        torch.distributed.broadcast(flag, src=0)
+        ok = bool(flag.item())
+    return ok

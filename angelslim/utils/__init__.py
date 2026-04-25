@@ -30,3 +30,9 @@ from .utils import print_info  # noqa: F401
 from .utils import print_with_rank  # noqa: F401
 from .utils import rank0_print  # noqa: F401
 from .utils import set_op_by_name  # noqa: F401
+from .zero3_loader import linearize_moe_experts  # noqa: F401
+from .zero3_loader import zero3_empty_model_from_pretrained  # noqa: F401
+from .zero3_utils import gathered_param_if_zero3  # noqa: F401
+from .zero3_utils import gathered_params_if_zero3  # noqa: F401
+from .zero3_utils import is_deepspeed_zero3_enabled  # noqa: F401
+from .zero3_utils import is_zero3_param  # noqa: F401

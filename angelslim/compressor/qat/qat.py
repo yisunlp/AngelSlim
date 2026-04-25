@@ -17,7 +17,7 @@ import os
 import torch
 from safetensors.torch import save_file
 
-from ...utils import print_info, set_op_by_name
+from ...utils import gathered_param_if_zero3, is_zero3_param, print_info, set_op_by_name
 from ..compressor_factory import CompressorFactory
 from ..quant.modules.helper_layer import QDQModule
 from .modules.quantizer import QuantLinear
@@ -57,6 +57,10 @@ class QAT:
                 quant_info=self.quant_info,
                 ignore_layers=self.config["compress_config"].quantization.ignore_layers,
                 resume_ckpt_dir=self.config["compress_config"].QAT.resume_ckpt_dir,
+                from_ptq_ckpt_dir=self.config["compress_config"].QAT.from_ptq_ckpt,
+                require_external_scales_for_zero3=self.config[
+                    "compress_config"
+                ].QAT.require_external_scales_for_zero3,
                 config=self.plugin_config.get("quant_config", {}),
                 quant_model=self.quant_model,
             )
@@ -88,13 +92,13 @@ class QAT:
         for name, module in quant_linear_modules:
             weight_scale = None
             if hasattr(module, "weight_quantizer"):
-                weight_scale = module.weight_quantizer.scale.data.clone()
+                weight_scale = _clone_param(module.weight_quantizer.scale)
 
             input_scale = None
             if module.use_act_quant and hasattr(module, "act_quantizer"):
                 act_quantizer = module.act_quantizer
                 if hasattr(act_quantizer, "scale") and act_quantizer.scale is not None:
-                    input_scale = act_quantizer.scale.data.clone()
+                    input_scale = _clone_param(act_quantizer.scale)
 
             qdq_module = QDQModule(
                 quant_algo=quant_algo,
@@ -126,7 +130,7 @@ class QAT:
             else:
                 continue
             scale_key = f"{cache_name}.scale"
-            kv_scales[scale_key] = module.qkv_quantizer.scale.data.clone().float().cpu()
+            kv_scales[scale_key] = _clone_param(module.qkv_quantizer.scale).float().cpu()
 
         os.makedirs(save_path, exist_ok=True)
         out_file = os.path.join(save_path, "kv_cache_scales.safetensors")
@@ -146,7 +150,7 @@ class QAT:
         # "real": save real-quant model via model-specific save function
         elif self.save_fmt == "real":
             save_func = self.quant_model.get_save_func()(self.quant_model)
-            save_func.save(os.path.join(save_path, "final_quant_checkpoint"))
+            self._invoke_save(save_func, os.path.join(save_path, "final_quant_checkpoint"))
 
         # "save_kvcache_only": only export KV cache scales (kv_cache_scales.safetensors)
         elif self.save_fmt == "save_kvcache_only":
@@ -155,8 +159,58 @@ class QAT:
         # "real_and_kvcache": save real-quant model AND KV cache scales
         elif self.save_fmt == "real_and_kvcache":
             save_func = self.quant_model.get_save_func()(self.quant_model)
-            save_func.save(os.path.join(save_path, "final_quant_checkpoint"))
+            self._invoke_save(save_func, os.path.join(save_path, "final_quant_checkpoint"))
             self._save_kv_cache_scales(os.path.join(save_path, "final_quant_checkpoint"))
 
         else:
             print_info("Save format not specified, skip save.")
+
+    def _invoke_save(self, save_func, save_target_dir):
+        if not _model_has_zero3_params(self.quant_model.model):
+            save_func.save(save_target_dir)
+            return
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        consolidated_state = _build_consolidated_state_dict(self.quant_model.model)
+        hf_model = self.quant_model.get_model()
+        original_state_dict = hf_model.state_dict
+
+        def _patched_state_dict(*args, **kwargs):
+            return consolidated_state if rank == 0 else {}
+
+        try:
+            hf_model.state_dict = _patched_state_dict
+            if rank == 0:
+                save_func.save(save_target_dir)
+        finally:
+            hf_model.state_dict = original_state_dict
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+
+def _clone_param(param):
+    with gathered_param_if_zero3(param):
+        return param.detach().clone()
+
+
+def _model_has_zero3_params(model):
+    return any(is_zero3_param(param) for param in model.parameters())
+
+
+def _build_consolidated_state_dict(model):
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    state_dict = {}
+    for name, param in model.named_parameters():
+        with gathered_param_if_zero3(param):
+            if rank == 0:
+                state_dict[name] = param.detach().cpu().clone()
+
+    if rank == 0:
+        for module_name, module in model.named_modules():
+            for buffer_name, buffer in module.named_buffers(recurse=False):
+                if buffer is None or buffer_name in module._non_persistent_buffers_set:
+                    continue
+                full_name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+                state_dict[full_name] = buffer.detach().cpu().clone()
+    return state_dict
