@@ -3,7 +3,7 @@ global:
 
 model:
   name: Qwen
-  model_path: /path/to/Qwen3-30B-A3B
+  model_path: /apdcephfs_zwfy2/share_301053287/brunosu/all_models/Qwen3-30B-A3B
   trust_remote_code: true
   torch_dtype: auto
   device_map: None
@@ -21,7 +21,7 @@ compression:
       group_size: -1
     ignore_layers: ["lm_head", "embed_tokens", "gate.weight"]
   QAT:
-    from_ptq_ckpt: /path/to/external/scales_or_final_quant_checkpoint
+    from_ptq_ckpt: /apdcephfs_zwfy2/share_301053287/brunosu/all_models/Qwen3-30B-A3B
     require_external_scales_for_zero3: true
     training_mode: end2end
     dist_mode: hf
@@ -70,6 +70,6 @@ compression:
 dataset:
   name: TextDataset
   data_path: ./dataset/sharegpt_gpt4_qwen/sharegpt_gpt4-qwen3_a22B_output.jsonl
-  max_seq_length: 1024
+  max_seq_length: 4096
   num_samples: 256
   batch_size: 1
