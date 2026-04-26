@@ -30,13 +30,13 @@ from .utils import print_info  # noqa: F401
 from .utils import print_with_rank  # noqa: F401
 from .utils import rank0_print  # noqa: F401
 from .utils import set_op_by_name  # noqa: F401
+from .zero3_io import LinearizedMoeExperts  # noqa: F401
 from .zero3_io import consolidated_state_dict  # noqa: F401
 from .zero3_io import gathered_param_if_zero3  # noqa: F401
 from .zero3_io import gathered_params_if_zero3  # noqa: F401
 from .zero3_io import is_deepspeed_zero3_enabled  # noqa: F401
 from .zero3_io import is_zero3_param  # noqa: F401
 from .zero3_io import linearize_moe_experts_empty  # noqa: F401
-from .zero3_io import LinearizedMoeExperts  # noqa: F401
 from .zero3_io import model_has_zero3_params  # noqa: F401
 from .zero3_io import patch_deepspeed_duplicate_check  # noqa: F401
 from .zero3_io import save_via_model_save_func  # noqa: F401

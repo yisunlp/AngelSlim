@@ -289,9 +289,7 @@ def _prewarm_hf_deepspeed_config(config):
         output_dir=config.global_config.save_path,
         **hf_args,
     )
-    print_info(
-        "[DeepSpeed pre-warm] HfTrainerDeepSpeedConfig registered before model load."
-    )
+    print_info("[DeepSpeed pre-warm] HfTrainerDeepSpeedConfig registered before model load.")
     return trainer_args
 
 

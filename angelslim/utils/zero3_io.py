@@ -174,16 +174,25 @@ class LinearizedMoeExperts(nn.Module):
             expert = nn.ModuleDict(
                 {
                     "gate_proj": nn.Linear(
-                        self.hidden_dim, self.intermediate_dim,
-                        bias=False, dtype=dtype, device=device,
+                        self.hidden_dim,
+                        self.intermediate_dim,
+                        bias=False,
+                        dtype=dtype,
+                        device=device,
                     ),
                     "up_proj": nn.Linear(
-                        self.hidden_dim, self.intermediate_dim,
-                        bias=False, dtype=dtype, device=device,
+                        self.hidden_dim,
+                        self.intermediate_dim,
+                        bias=False,
+                        dtype=dtype,
+                        device=device,
                     ),
                     "down_proj": nn.Linear(
-                        self.intermediate_dim, self.hidden_dim,
-                        bias=False, dtype=dtype, device=device,
+                        self.intermediate_dim,
+                        self.hidden_dim,
+                        bias=False,
+                        dtype=dtype,
+                        device=device,
                     ),
                 }
             )
@@ -200,9 +209,7 @@ class LinearizedMoeExperts(nn.Module):
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(
-                top_k_index, num_classes=self.num_experts
-            )
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
             expert_mask = expert_mask.permute(2, 1, 0)
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
@@ -234,8 +241,14 @@ def _is_fused_moe_experts(module) -> bool:
     plus ``num_experts``, ``hidden_dim``, ``intermediate_dim``, ``act_fn``."""
     if isinstance(module, LinearizedMoeExperts):
         return False
-    required = ("gate_up_proj", "down_proj", "num_experts", "hidden_dim",
-                "intermediate_dim", "act_fn")
+    required = (
+        "gate_up_proj",
+        "down_proj",
+        "num_experts",
+        "hidden_dim",
+        "intermediate_dim",
+        "act_fn",
+    )
     return all(hasattr(module, a) for a in required)
 
 
@@ -380,7 +393,9 @@ def zero3_empty_model_from_pretrained(
     # is_deepspeed_zero3_enabled() returns True).
     with no_init_weights(), no_tie_weights():
         model = AutoModelForCausalLM.from_config(
-            config, torch_dtype=resolved, trust_remote_code=trust_remote_code,
+            config,
+            torch_dtype=resolved,
+            trust_remote_code=trust_remote_code,
         )
 
     # Linearize fused MoE experts BEFORE weight loading so the loader can
@@ -422,9 +437,7 @@ def _broadcast_into_target(src, target, *, is_buffer=False, key=None):
         then broadcast.
       * Single-process: direct copy.
     """
-    dist_active = (
-        torch.distributed.is_available() and torch.distributed.is_initialized()
-    )
+    dist_active = torch.distributed.is_available() and torch.distributed.is_initialized()
 
     if is_zero3_param(target):
         with gathered_param_if_zero3(target, modifier_rank=0):
@@ -481,7 +494,8 @@ def stream_load_weights(model, model_path, log_prefix="[zero3]"):
                     base = key[: -len(".gate_up_proj")]
                     src = reader.get_tensor(key) if rank == 0 else None
                     n_exp = (
-                        int(src.shape[0]) if src is not None
+                        int(src.shape[0])
+                        if src is not None
                         else _infer_num_experts(base, name_to_param)
                     )
                     for i in range(n_exp):
@@ -495,11 +509,13 @@ def stream_load_weights(model, model_path, log_prefix="[zero3]"):
                         gsrc = src[i].chunk(2, dim=-2)[0] if src is not None else None
                         usrc = src[i].chunk(2, dim=-2)[1] if src is not None else None
                         if _broadcast_into_target(gsrc, gtgt, key=gkey):
-                            seen_targets.add(gkey); loaded += 1
+                            seen_targets.add(gkey)
+                            loaded += 1
                         else:
                             skipped += 1
                         if _broadcast_into_target(usrc, utgt, key=ukey):
-                            seen_targets.add(ukey); loaded += 1
+                            seen_targets.add(ukey)
+                            loaded += 1
                         else:
                             skipped += 1
                     del src
@@ -507,7 +523,8 @@ def stream_load_weights(model, model_path, log_prefix="[zero3]"):
                     base = key[: -len(".down_proj")]
                     src = reader.get_tensor(key) if rank == 0 else None
                     n_exp = (
-                        int(src.shape[0]) if src is not None
+                        int(src.shape[0])
+                        if src is not None
                         else _infer_num_experts(base, name_to_param)
                     )
                     for i in range(n_exp):
@@ -518,7 +535,8 @@ def stream_load_weights(model, model_path, log_prefix="[zero3]"):
                             continue
                         dsrc = src[i] if src is not None else None
                         if _broadcast_into_target(dsrc, dtgt, key=dkey):
-                            seen_targets.add(dkey); loaded += 1
+                            seen_targets.add(dkey)
+                            loaded += 1
                         else:
                             skipped += 1
                     del src
@@ -533,7 +551,8 @@ def stream_load_weights(model, model_path, log_prefix="[zero3]"):
                         continue
                     src = reader.get_tensor(key) if rank == 0 else None
                     if _broadcast_into_target(src, tgt, is_buffer=is_buf, key=key):
-                        seen_targets.add(key); loaded += 1
+                        seen_targets.add(key)
+                        loaded += 1
                     else:
                         skipped += 1
                     del src
@@ -561,7 +580,7 @@ def _infer_num_experts(base, name_to_param):
     for name in name_to_param:
         if not name.startswith(prefix):
             continue
-        first = name[len(prefix):].split(".", 1)[0]
+        first = name[len(prefix) :].split(".", 1)[0]
         if first.isdigit():
             ids.append(int(first))
     return (max(ids) + 1) if ids else 0
@@ -575,11 +594,11 @@ def _infer_num_experts(base, name_to_param):
 _SCALE_SUFFIX_RULES = [
     # (suffix_in_ckpt, quantizer_attr_on_QuantLinear, sub_attr, layer_name_rewrite)
     (".weight_zero_point", "weight_quantizer", "zero_point", None),
-    (".input_zero_point",  "act_quantizer",    "zero_point", None),
-    (".weight_scale",      "weight_quantizer", "scale",      None),
-    (".input_scale",       "act_quantizer",    "scale",      None),
-    (".k_cache.scale",     "qkv_quantizer",    "scale",      ".k_proj"),
-    (".v_cache.scale",     "qkv_quantizer",    "scale",      ".v_proj"),
+    (".input_zero_point", "act_quantizer", "zero_point", None),
+    (".weight_scale", "weight_quantizer", "scale", None),
+    (".input_scale", "act_quantizer", "scale", None),
+    (".k_cache.scale", "qkv_quantizer", "scale", ".k_proj"),
+    (".v_cache.scale", "qkv_quantizer", "scale", ".v_proj"),
 ]
 # Longest first to avoid '.scale' winning over '.k_cache.scale'.
 _SCALE_SUFFIX_RULES.sort(key=lambda r: len(r[0]), reverse=True)
@@ -605,13 +624,15 @@ def _expand_scale_targets(layer_name, qname, sub, named_modules):
     if layer_name.endswith(".experts.gate_up_proj"):
         base = layer_name[: -len(".gate_up_proj")]
         return [
-            (n, qname, sub) for n in named_modules
+            (n, qname, sub)
+            for n in named_modules
             if n.startswith(base + ".") and (n.endswith(".gate_proj") or n.endswith(".up_proj"))
         ]
     if layer_name.endswith(".experts.down_proj"):
         base = layer_name[: -len(".down_proj")]
         return [
-            (n, qname, sub) for n in named_modules
+            (n, qname, sub)
+            for n in named_modules
             if n.startswith(base + ".") and n.endswith(".down_proj")
         ]
     return []
@@ -637,7 +658,8 @@ def _copy_scale_into(src, target):
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         device = (
             torch.device("cuda", torch.cuda.current_device())
-            if torch.cuda.is_available() else target.device
+            if torch.cuda.is_available()
+            else target.device
         )
         flag = torch.tensor(int(ok), device=device)
         torch.distributed.broadcast(flag, src=0)
@@ -739,7 +761,10 @@ def consolidated_state_dict(model):
 
 
 def save_via_model_save_func(
-    quant_model, save_func, save_target_dir, prebuilt_state_dict=None,
+    quant_model,
+    save_func,
+    save_target_dir,
+    prebuilt_state_dict=None,
 ):
     """Invoke ``save_func.save(...)`` with the model's ``state_dict`` patched
     to return a consolidated rank-0 dict.

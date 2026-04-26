@@ -48,74 +48,180 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
         self.loss_type = str(loss_config.get("loss_type", "origin")).lower()
         self.loss_topk = loss_config.get("loss_topk")
         self.kd_temperature = float(loss_config.get("kd_temperature", 1.0))
+        # ``kd_alpha`` kept for backward compat but IGNORED when
+        # ``lm_loss_weight`` / ``kd_loss_weight`` are the (new) source of
+        # truth.
         self.kd_alpha = float(loss_config.get("kd_alpha", 0.5))
+        self.lm_loss_weight = float(loss_config.get("lm_loss_weight", 1.0))
+        self.kd_loss_weight = float(loss_config.get("kd_loss_weight", 0.0))
         self.use_weight_quant = quant_config.get("use_weight_quant", False)
         self.use_activation_quant = quant_config.get("use_activation_quant", False)
         self.use_qkv_quant = quant_config.get("use_qkv_quant", False)
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        if self.loss_type == "origin":
-            return super().compute_loss(
-                model,
-                inputs,
-                return_outputs=return_outputs,
-                num_items_in_batch=num_items_in_batch,
+        # Running metric aggregator keyed by logger mode.
+        from collections import defaultdict
+
+        self._qat_metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+
+    # ------------------------------------------------------------------
+    # KD loss helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _kl_per_token(log_p_src: torch.Tensor, p_tgt: torch.Tensor) -> torch.Tensor:
+        """Per-token KL(tgt || src)  (shape [N])."""
+        return F.kl_div(log_p_src, p_tgt, reduction="none").sum(dim=-1)
+
+    def _compute_kd_components(self, student_logits, teacher_logits, labels):
+        """Return a dict of per-token KD losses computed only on valid
+        (label != -100) positions. Keys present depend on ``self.loss_type``.
+
+        Always returns ``forward_kl`` and ``backward_kl`` (useful for
+        logging even when the main kd loss is e.g. ``mse`` or a topk
+        variant) — but only when kd_loss_weight > 0.
+        """
+        flat_mask = (labels != -100).reshape(-1)
+        if flat_mask.sum() == 0:
+            zero = student_logits.new_zeros(())
+            return {"loss": zero, "forward_kl": zero, "backward_kl": zero}
+
+        # Flatten to [N, V] and keep only valid tokens.
+        s_flat = student_logits.flatten(0, -2)[flat_mask]
+        t_flat = teacher_logits.flatten(0, -2)[flat_mask]
+        valid_labels = labels.reshape(-1)[flat_mask]
+
+        # Diagnostic KL (always computed at T=1 on valid tokens).
+        s_logp = F.log_softmax(s_flat, dim=-1)
+        t_logp = F.log_softmax(t_flat, dim=-1)
+        s_p = s_logp.exp()
+        t_p = t_logp.exp()
+        forward_kl = self._kl_per_token(s_logp, t_p).mean()
+        backward_kl = self._kl_per_token(t_logp, s_p).mean()
+
+        # Main KD loss according to loss_type.
+        if self.loss_type == "kl":
+            kd = forward_kl
+        elif self.loss_type == "rkl":
+            kd = backward_kl
+        elif self.loss_type == "mse":
+            kd = F.mse_loss(s_flat, t_flat)
+        elif self.loss_type == "kd":
+            # Legacy "kd": temperature-scaled forward KL. Combined loss is
+            # (alpha*T^2)*KD + (1-alpha)*lm — but we now rely on
+            # lm/kd_loss_weight for the outer combination, so return just
+            # the scaled KL here.
+            T = max(self.kd_temperature, 1e-6)
+            kd = self._kl_per_token(
+                F.log_softmax(s_flat / T, dim=-1),
+                F.softmax(t_flat / T, dim=-1),
+            ).mean() * (T * T)
+        elif self.loss_type == "cakld":
+            # Contextual Asymmetric KL-divergence: per-token mixing of
+            # forward / reverse KL by teacher's confidence on the label.
+            per_tok_fkl = self._kl_per_token(s_logp, t_p)
+            per_tok_bkl = self._kl_per_token(t_logp, s_p)
+            conf = torch.gather(t_p, dim=-1, index=valid_labels.unsqueeze(-1)).squeeze(-1)  # [N]
+            kd = (conf * per_tok_bkl + (1.0 - conf) * per_tok_fkl).mean()
+        elif self._is_reverse_topk_loss(self.loss_type):
+            topk = self._resolve_topk(self.loss_type, s_flat.size(-1))
+            top_s, idx = s_flat.topk(topk, dim=-1, sorted=False)
+            top_t = t_flat.gather(-1, idx)
+            kd = self._kl_per_token(
+                F.log_softmax(top_t, dim=-1),
+                F.softmax(top_s, dim=-1),
+            ).mean()
+        elif self._is_forward_topk_loss(self.loss_type):
+            topk = self._resolve_topk(self.loss_type, t_flat.size(-1))
+            top_t, idx = t_flat.topk(topk, dim=-1, sorted=False)
+            top_s = s_flat.gather(-1, idx)
+            kd = self._kl_per_token(
+                F.log_softmax(top_s, dim=-1),
+                F.softmax(top_t, dim=-1),
+            ).mean()
+        else:
+            raise ValueError(
+                f"Unsupported QAT kd loss_type: {self.loss_type}. "
+                "Valid: kl, rkl, mse, kd, cakld, kl_top[_K], r_kl_top[_K]."
             )
 
-        teacher_logits = self.get_ori_outputs(model, inputs).logits
+        return {"loss": kd, "forward_kl": forward_kl, "backward_kl": backward_kl}
+
+    def _record(self, name, value):
+        if value is None:
+            return
+        mode = "train" if self.model.training else "eval"
+        v = value.detach().float() if isinstance(value, torch.Tensor) else float(value)
+        if isinstance(v, torch.Tensor):
+            self._qat_metrics[mode][name].append(v.item())
+        else:
+            self._qat_metrics[mode][name].append(v)
+
+    # ------------------------------------------------------------------
+    # compute_loss
+    # ------------------------------------------------------------------
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.get("labels", None)
+        lm_on = self.lm_loss_weight > 0.0
+        kd_on = self.kd_loss_weight > 0.0
+
+        # Back-compat: ``loss_type="origin"`` means "pure HF CE loss" → the
+        # classic SFT path with no distillation. Honour it even when the
+        # user forgot to set kd_loss_weight=0.
+        if self.loss_type == "origin":
+            kd_on = False
+
+        if not lm_on and not kd_on:
+            raise ValueError("Both lm_loss_weight and kd_loss_weight are 0 — nothing to optimise.")
+
+        # Student forward — always needed.
+        # HF CausalLM loss is computed when ``labels`` is present in inputs.
         student_inputs = dict(inputs)
-        if self.loss_type != "kd":
+        if not lm_on:
+            # Still need labels for flat_mask; pop from student kwargs to
+            # skip HF's internal CE and save some compute.
             student_inputs.pop("labels", None)
         outputs = model(**student_inputs)
-        student_logits = outputs.logits
 
-        if self.loss_type == "kl":
-            loss = F.kl_div(
-                F.log_softmax(student_logits.flatten(0, -2), dim=-1),
-                F.softmax(teacher_logits.flatten(0, -2), dim=-1),
-                reduction="batchmean",
+        lm_loss = outputs.loss if lm_on and getattr(outputs, "loss", None) is not None else None
+        if lm_on and lm_loss is None:
+            raise ValueError(
+                "lm_loss_weight > 0 but model did not return a loss — "
+                "check that ``labels`` is set in the batch."
             )
-        elif self.loss_type == "rkl":
-            loss = F.kl_div(
-                F.log_softmax(teacher_logits.flatten(0, -2), dim=-1),
-                F.softmax(student_logits.flatten(0, -2), dim=-1),
-                reduction="batchmean",
-            )
-        elif self.loss_type == "mse":
-            loss = F.mse_loss(student_logits, teacher_logits)
-        elif self.loss_type == "kd":
-            if getattr(outputs, "loss", None) is None:
-                raise ValueError("loss_type='kd' requires labels to compute CE loss.")
-            temperature = max(self.kd_temperature, 1e-6)
-            alpha = self.kd_alpha
-            distill_loss = F.kl_div(
-                F.log_softmax(student_logits.flatten(0, -2) / temperature, dim=-1),
-                F.softmax(teacher_logits.flatten(0, -2) / temperature, dim=-1),
-                reduction="batchmean",
-            )
-            loss = outputs.loss * (1 - alpha) + distill_loss * (alpha * temperature * temperature)
-        elif self._is_reverse_topk_loss(self.loss_type):
-            topk = self._resolve_topk(self.loss_type, student_logits.size(-1))
-            top_student_logits, indices = student_logits.topk(topk, dim=-1, sorted=False)
-            top_teacher_logits = teacher_logits.gather(-1, indices)
-            loss = F.kl_div(
-                F.log_softmax(top_teacher_logits.flatten(0, -2), dim=-1),
-                F.softmax(top_student_logits.flatten(0, -2), dim=-1),
-                reduction="batchmean",
-            )
-        elif self._is_forward_topk_loss(self.loss_type):
-            topk = self._resolve_topk(self.loss_type, teacher_logits.size(-1))
-            top_teacher_logits, indices = teacher_logits.topk(topk, dim=-1, sorted=False)
-            top_student_logits = student_logits.gather(-1, indices)
-            loss = F.kl_div(
-                F.log_softmax(top_student_logits.flatten(0, -2), dim=-1),
-                F.softmax(top_teacher_logits.flatten(0, -2), dim=-1),
-                reduction="batchmean",
-            )
-        else:
-            raise ValueError(f"Unsupported QAT loss_type: {self.loss_type}")
 
-        return (loss, outputs) if return_outputs else loss
+        kd_info = None
+        if kd_on:
+            if labels is None:
+                raise ValueError("kd_loss_weight > 0 requires ``labels`` in the batch.")
+            teacher_logits = self.get_ori_outputs(model, inputs).logits
+            kd_info = self._compute_kd_components(
+                outputs.logits,
+                teacher_logits,
+                labels,
+            )
+
+        # Combine.
+        total = outputs.logits.new_zeros(())
+        if lm_loss is not None:
+            total = total + self.lm_loss_weight * lm_loss
+        if kd_info is not None:
+            total = total + self.kd_loss_weight * kd_info["loss"]
+
+        # Logging: record every component whose weight is > 0, plus the
+        # always-informative forward/backward KL diagnostics when kd is on.
+        if lm_on and lm_loss is not None:
+            self._record("lm_loss", lm_loss)
+        if kd_on and kd_info is not None:
+            self._record(f"kd/{self.loss_type}", kd_info["loss"])
+            # Diagnostic KL(L/R) for any kd variant. Useful to monitor
+            # teacher-student disagreement independent of the combined
+            # objective.
+            self._record("kd/forward_kl", kd_info["forward_kl"])
+            self._record("kd/backward_kl", kd_info["backward_kl"])
+        self._record("total_loss", total)
+
+        return (total, outputs) if return_outputs else total
 
     @staticmethod
     def _is_forward_topk_loss(loss_type):
@@ -153,6 +259,31 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
             )
         return outputs
 
+    def log(self, logs, start_time=None, *args, **kwargs):
+        """Inject running QAT loss components (lm_loss / kd/... / kd/forward_kl
+        / kd/backward_kl / total_loss) into HuggingFace Trainer's log dict.
+
+        Each value is averaged across the steps accumulated since the
+        previous ``log`` call, then the accumulator is cleared — matching
+        HF Trainer's behaviour for its built-in ``loss`` key.
+        """
+        mode = "train" if self.model.training else "eval"
+        bucket = self._qat_metrics.get(mode, {})
+        if bucket:
+            for key, vals in bucket.items():
+                if not vals:
+                    continue
+                avg = sum(vals) / len(vals)
+                out_key = key if mode == "train" else f"eval_{key}"
+                logs[out_key] = float(avg)
+            bucket.clear()
+
+        # Forward to HF Trainer's log. Signature differs across versions.
+        try:
+            return super().log(logs, start_time, *args, **kwargs)
+        except TypeError:
+            return super().log(logs)
+
 
 @TrainerFactory.register("end2end")
 class End2EndTrainer:
@@ -174,6 +305,8 @@ class End2EndTrainer:
             "loss_topk": config["compress_config"].QAT.loss_topk,
             "kd_temperature": config["compress_config"].QAT.kd_temperature,
             "kd_alpha": config["compress_config"].QAT.kd_alpha,
+            "lm_loss_weight": config["compress_config"].QAT.lm_loss_weight,
+            "kd_loss_weight": config["compress_config"].QAT.kd_loss_weight,
         }
         self.quant_config = {
             "use_weight_quant": config["compress_config"]
@@ -222,9 +355,7 @@ class End2EndTrainer:
                 and ("clip_factor_w_max" in n or "clip_factor_w_min" in n),
             )
             lwc_param_count = len(lwc_params)
-            params.append(
-                {"params": lwc_params, "weight_decay": wd, "lr": lwc_lr}
-            )
+            params.append({"params": lwc_params, "weight_decay": wd, "lr": lwc_lr})
 
         if not any(group["params"] for group in params):
             raise ValueError("QAT optimizer has no trainable parameters.")

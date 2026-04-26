@@ -3,11 +3,12 @@ global:
 
 model:
   name: Qwen
-  model_path: /apdcephfs_zwfy2/share_301053287/brunosu/all_models/Qwen3-30B-A3B
+  # Local directory or HuggingFace repo id of the base Qwen3-30B-A3B model.
+  model_path: Qwen/Qwen3-30B-A3B
   trust_remote_code: true
   torch_dtype: auto
-  # ZeRO-3 wants HF to NOT place the model with device_map; we pass
-  # ``None`` here and the Engine normalizes the string "None"/"distributed".
+  # ZeRO-3 wants HF to NOT place the model with ``device_map``. Pass
+  # ``None`` here; the Engine normalises the string "None"/"distributed".
   device_map: None
   low_cpu_mem_usage: true
   use_cache: false
@@ -22,34 +23,35 @@ compression:
       activation: per-tensor
     ignore_layers: ["lm_head", "embed_tokens", "gate.weight"]
   QAT:
-    # Leave ``hf_dataset`` unset → End2EndTrainer.prepare_dataset falls back
-    # to the ``dataset:`` section below (local TextDataset).
+    # Leave ``hf_dataset`` unset → the trainer falls back to the local
+    # TextDataset defined in the ``dataset:`` section below.
     hf_dataset: null
-    # REQUIRED under ZeRO-3: bootstrap scales from a previous PTQ "real"
-    # checkpoint (same model_path works if it already carries scales; else
-    # point to an AngelSlim PTQ output dir). For the plain base model we
-    # just fall back to the init-value below, so this file MUST exist or
-    # the directory must contain *.safetensors even if they only carry
-    # base weights (scales will be initialised from weight_scale_init_value
-    # and activation_scale_init_value).
-    from_ptq_ckpt: /apdcephfs_zwfy2/share_301053287/brunosu/all_models/Qwen3-30B-A3B
+    # REQUIRED under ZeRO-3: warm-start scales from a previous PTQ "real"
+    # checkpoint. Produce it with e.g.
+    #   python tools/run.py -c configs/qwen3/ptq/fp8_static/qwen3-a3b_fp8_static.yaml
+    from_ptq_ckpt: ./output_ptq_30b/qwen3-a3b_fp8_static
     training_mode: end2end
     dist_mode: hf
     save_format: real
     do_train: true
-    loss_type: origin
+    # KD + LM loss combination: loss_type picks the KD variant,
+    # lm_loss_weight / kd_loss_weight control the outer mix.
+    # loss_type choices: kl | rkl | mse | cakld | kd | kl_top_K | r_kl_top_K
+    loss_type: cakld
     loss_topk: null
     kd_temperature: 1.0
     kd_alpha: 0.5
+    lm_loss_weight: 1.0
+    kd_loss_weight: 1.0
     plugin_config:
       enable_scale: true
       quant_config:
         use_weight_quant: true
         use_activation_quant: true
         use_qkv_quant: false
-        # Init values used under ZeRO-3 when weight data is not accessible
-        # (and as fallback whenever the from_ptq_ckpt does not carry scale
-        # tensors).
+        # Init values used when weight data is not accessible (e.g. under
+        # ZeRO-3) and for quantizer parameters missing from the PTQ
+        # checkpoint.
         weight_scale_init_value: 0.1
         activation_scale_init_value: 0.1
         learnable:
@@ -59,11 +61,12 @@ compression:
           norm: false
           lwc: false
     hf_args:
+      bf16: true
       logging_steps: 1
       logging_first_step: true
       per_device_train_batch_size: 1
       gradient_accumulation_steps: 1
-      learning_rate: 1.0e-4
+      learning_rate: 1.0e-6
       lr_scheduler_type: cosine
       num_train_epochs: 1
       max_steps: 3

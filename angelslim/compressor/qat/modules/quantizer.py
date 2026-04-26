@@ -245,9 +245,7 @@ class Quantizer(nn.Module):
             else:
                 dim1 = 1
 
-            init = (
-                torch.ones((dim1, 1), device=device, dtype=torch.float32) * self.lwc_init_value
-            )
+            init = torch.ones((dim1, 1), device=device, dtype=torch.float32) * self.lwc_init_value
             self.clip_factor_w_max = nn.Parameter(init.clone(), requires_grad=True)
             self.clip_factor_w_min = nn.Parameter(init.clone(), requires_grad=True)
             self.sigmoid = nn.Sigmoid()
@@ -561,7 +559,14 @@ class Quantizer(nn.Module):
             None if self.is_sym else clamp_ste(round_ste(self.zero_point), self.qmin, self.qmax)
         )
         scale, round_zero_point = self._expand_scale_zp(scale, round_zero_point, x)
-        return self._fake_quant_with_params(x, scale, round_zero_point)
+        out = self._fake_quant_with_params(x, scale, round_zero_point)
+        # Scale is kept in fp32 for numerical stability, but multiplying by
+        # a bf16/fp16 activation upcasts the result. Cast back to the input
+        # dtype so downstream F.linear / DeepSpeed autocast wrappers see a
+        # consistent dtype.
+        if out.dtype != x.dtype:
+            out = out.to(x.dtype)
+        return out
 
     def forward(self, x: torch.Tensor):
         if self.bits >= 16:
@@ -611,7 +616,10 @@ class QuantLinear(nn.Module):
         weight_shape = (org_module.out_features, org_module.in_features)
         if self.use_weight_quant:
             self.weight_quantizer = Quantizer(
-                config, quant_info, x=org_module.weight, weight_shape=weight_shape,
+                config,
+                quant_info,
+                x=org_module.weight,
+                weight_shape=weight_shape,
             )
         if self.use_act_quant:
             self.act_quantizer = Quantizer(config, quant_info, is_act=True, resume=resume)
@@ -629,7 +637,17 @@ class QuantLinear(nn.Module):
         weight = self.weight_quantizer(self.weight) if self.use_weight_quant else self.weight
         if self.use_act_quant:
             input = self.act_quantizer(input)
-        output = self.fwd_func(input, weight, self.bias)
+        # Defensive dtype alignment: upstream (DeepSpeed ZeRO-3 / HF
+        # autocast) may have cast ``input`` to fp16 even though we run in
+        # bf16. Align to the (fake-quantised) weight dtype so F.linear
+        # stays consistent.
+        if input.dtype != weight.dtype:
+            input = input.to(weight.dtype)
+        # Disable autocast around the matmul so the DeepSpeed
+        # zero3_linear_wrap wrapper (decorated with ``autocast_custom_fwd``)
+        # does NOT silently re-cast ``input`` back to the autocast dtype.
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            output = self.fwd_func(input, weight, self.bias)
         if self.use_qkv_quant:
             output = self.qkv_quantizer(output)
         return output

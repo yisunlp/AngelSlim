@@ -282,6 +282,13 @@ class QATTrainingConfig:
     loss_topk: Optional[int] = None
     kd_temperature: float = field(default=1.0)
     kd_alpha: float = field(default=0.5)
+    # ---- new loss-weight controls (compose LM + KD loss) ----
+    # lm_loss_weight: weight on the HF CausalLM CE loss (labels must be set).
+    # kd_loss_weight: weight on the chosen distillation loss (kl / rkl / mse
+    #   / kl_top_K / r_kl_top_K / cakld / jsd ...). Only loss components
+    #   with a strictly-positive weight are computed AND logged.
+    lm_loss_weight: float = field(default=1.0)
+    kd_loss_weight: float = field(default=0.0)
     hf_args: Dict[str, Any] = field(default_factory=dict)
 
 

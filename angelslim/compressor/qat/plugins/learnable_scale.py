@@ -79,9 +79,7 @@ class LearnableScalePlugin(BasePlugin):
         # plan to fill it from a checkpoint (full resume OR PTQ warm-start
         # OR ZeRO-3 — where lazy_init is impossible).
         act_preallocate = (
-            self.resume_ckpt_dir is not None
-            or self.from_ptq_ckpt_dir is not None
-            or zero3
+            self.resume_ckpt_dir is not None or self.from_ptq_ckpt_dir is not None or zero3
         )
         for name, module in self.quant_model.model.named_modules():
             if isinstance(module, torch.nn.Linear):

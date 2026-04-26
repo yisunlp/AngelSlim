@@ -115,22 +115,21 @@ class QAT:
             return
 
         zero3 = model_has_zero3_params(self.quant_model.model)
-        rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_initialized() else 0
-        )
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         quant_algo = self.quant_info.quant_algo
 
         if not zero3:
             # ----- single-GPU / non-ZeRO-3 path: original behaviour -----
             print_info("Start QAT convert: replacing QuantLinear with QDQModule...")
             for name, module in [
-                (n, m) for n, m in self.quant_model.model.named_modules()
+                (n, m)
+                for n, m in self.quant_model.model.named_modules()
                 if isinstance(m, QuantLinear)
             ]:
                 weight_scale = (
                     module.weight_quantizer.scale.data.clone()
-                    if hasattr(module, "weight_quantizer") else None
+                    if hasattr(module, "weight_quantizer")
+                    else None
                 )
                 input_scale = None
                 if module.use_act_quant and hasattr(module, "act_quantizer"):
@@ -167,8 +166,7 @@ class QAT:
         self._rank0_state_dict = {} if rank == 0 else {}
 
         quant_linear_modules = [
-            (n, m) for n, m in self.quant_model.model.named_modules()
-            if isinstance(m, QuantLinear)
+            (n, m) for n, m in self.quant_model.model.named_modules() if isinstance(m, QuantLinear)
         ]
         consumed_prefixes = set()
 
@@ -248,10 +246,7 @@ class QAT:
 
     def _save_kv_cache_scales(self, save_path: str):
         """Extract and save KV cache scales to a safetensors file."""
-        rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_initialized() else 0
-        )
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         kv_scales = {}
         for name, module in self.quant_model.model.named_modules():
             if not isinstance(module, QuantLinear):
