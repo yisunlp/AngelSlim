@@ -738,19 +738,39 @@ def consolidated_state_dict(model):
     return sd
 
 
-def save_via_model_save_func(quant_model, save_func, save_target_dir):
+def save_via_model_save_func(
+    quant_model, save_func, save_target_dir, prebuilt_state_dict=None,
+):
     """Invoke ``save_func.save(...)`` with the model's ``state_dict`` patched
-    to return the consolidated rank-0 dict.
+    to return a consolidated rank-0 dict.
+
+    Parameters
+    ----------
+    prebuilt_state_dict : dict | None
+        If provided (rank 0), use this dict directly and skip the per-param
+        gather+clone pass over ``model``. This is the **recommended** path
+        under ZeRO-3 because the caller (typically ``QAT.convert``) has
+        already produced rank0's full state_dict layer-by-layer with bounded
+        peak memory. Other ranks may pass ``None``.
+
+        If ``None``, fall back to ``consolidated_state_dict(model)``, which
+        gathers every parameter once more — avoid this when ``model``
+        already holds large materialised tensors on rank 0 (it would double
+        the peak).
 
     No-op (delegates straight to ``save_func.save``) when no parameters are
     sharded.
     """
-    if not model_has_zero3_params(quant_model.model):
+    if not model_has_zero3_params(quant_model.model) and prebuilt_state_dict is None:
         save_func.save(save_target_dir)
         return
 
     rank = _rank()
-    sd = consolidated_state_dict(quant_model.model)
+    if prebuilt_state_dict is not None:
+        sd = prebuilt_state_dict if rank == 0 else {}
+    else:
+        sd = consolidated_state_dict(quant_model.model)
+
     hf_model = quant_model.get_model()
     original = hf_model.state_dict
 

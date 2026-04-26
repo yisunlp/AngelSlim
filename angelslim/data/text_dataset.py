@@ -74,9 +74,8 @@ class TextDataset(BaseDataset):
             inputs = {
                 "input_ids": torch.tensor(result["input_ids"][i]).unsqueeze(0).to(self.device)
             }
-            labels = inputs["input_ids"].roll(shifts=-1, dims=-1)
-            labels[:, -1] = -100
-            inputs["labels"] = labels.to(self.device)
+            # HF CausalLM models shift labels internally; feed labels == input_ids.
+            inputs["labels"] = inputs["input_ids"].clone()
             inputs["attention_mask"] = torch.tensor(result["attention_mask"][i]).to(self.device)
             self.data.append(inputs)
 
@@ -101,8 +100,8 @@ class TextDataset(BaseDataset):
             if "labels" in df.columns:
                 labels = torch.tensor(df["labels"].iloc[i]).unsqueeze(0)
             else:
-                labels = model_inputs["input_ids"].roll(shifts=-1, dims=-1)
-                labels[:, -1] = -100
+                # HF CausalLM models shift labels internally; feed labels == input_ids.
+                labels = model_inputs["input_ids"].clone()
 
             data_item = {
                 "input_ids": model_inputs["input_ids"].to(self.device),
@@ -157,8 +156,8 @@ class TextDataset(BaseDataset):
                     padding="max_length",
                 )
 
-                labels = model_inputs["input_ids"].roll(shifts=-1, dims=-1)
-                labels[:, -1] = -100
+                # HF CausalLM models shift labels internally; feed labels == input_ids.
+                labels = model_inputs["input_ids"].clone()
 
                 self.data.append(
                     {

@@ -626,9 +626,6 @@ class QuantLinear(nn.Module):
             )
 
     def forward(self, input: torch.Tensor):
-        if input.shape[0] == 0:
-            return self.fwd_func(input, self.weight, self.bias)
-
         weight = self.weight_quantizer(self.weight) if self.use_weight_quant else self.weight
         if self.use_act_quant:
             input = self.act_quantizer(input)

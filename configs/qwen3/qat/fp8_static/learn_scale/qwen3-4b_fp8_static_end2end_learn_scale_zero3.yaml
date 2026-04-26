@@ -20,7 +20,9 @@ compression:
       activation: per-tensor
     ignore_layers: ["lm_head", "embed_tokens"]
   QAT:
-    hf_dataset: Salesforce/wikitext,wikitext-2-raw-v1
+    # Leave ``hf_dataset`` unset → End2EndTrainer.prepare_dataset falls back
+    # to the ``dataset:`` section below (local TextDataset).
+    hf_dataset: null
     from_ptq_ckpt: /apdcephfs_zwfy2/share_301053287/brunosu/all_models/Qwen3-4B
     training_mode: end2end
     dist_mode: hf

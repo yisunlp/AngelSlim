@@ -22,7 +22,9 @@ compression:
       activation: per-tensor
     ignore_layers: ["lm_head", "embed_tokens", "gate.weight"]
   QAT:
-    hf_dataset: Salesforce/wikitext,wikitext-2-raw-v1
+    # Leave ``hf_dataset`` unset → End2EndTrainer.prepare_dataset falls back
+    # to the ``dataset:`` section below (local TextDataset).
+    hf_dataset: null
     # REQUIRED under ZeRO-3: bootstrap scales from a previous PTQ "real"
     # checkpoint (same model_path works if it already carries scales; else
     # point to an AngelSlim PTQ output dir). For the plain base model we
