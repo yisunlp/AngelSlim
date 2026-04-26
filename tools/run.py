@@ -29,6 +29,12 @@ def get_args():
     parser.add_argument("-c", "--config", type=str, required=True)
     parser.add_argument("--model-path", type=str, default=None)
     parser.add_argument("--save-path", type=str, default=None)
+    parser.add_argument(
+        "--from-ptq-ckpt",
+        type=str,
+        default=None,
+        help="Override compression.QAT.from_ptq_ckpt from the command line.",
+    )
     parser.add_argument("--multi-nodes", action="store_true")
     parser.add_argument("--lm-eval", action="store_true")
     parser.add_argument("--lm-eval-task", nargs="+", default=["ceval-valid"])
@@ -49,6 +55,12 @@ def merge_config(config, args):
         config.global_config.save_path = args.save_path
     if args.model_path is not None:
         config.model_config.model_path = args.model_path
+    if args.from_ptq_ckpt is not None:
+        qat_cfg = getattr(
+            getattr(config, "compression_config", None), "QAT", None
+        )
+        if qat_cfg is not None:
+            qat_cfg.from_ptq_ckpt = args.from_ptq_ckpt
     config.global_config.save_path = os.path.join(
         config.global_config.save_path,
         get_yaml_prefix_simple(args.config),

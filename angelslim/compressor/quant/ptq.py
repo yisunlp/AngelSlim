@@ -18,7 +18,15 @@ import warnings
 
 import torch
 from safetensors.torch import load_file
-from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeTextExperts
+try:
+    from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+        Qwen3VLMoeTextExperts,
+    )
+except Exception:  # transformers < 5.0 does not ship this module
+    class _MissingQwen3VLMoeTextExperts:  # sentinel so isinstance/class checks never match
+        pass
+
+    Qwen3VLMoeTextExperts = _MissingQwen3VLMoeTextExperts
 
 from ...utils import find_parent_layer_and_sub_name, print_info
 from ..compressor_factory import CompressorFactory

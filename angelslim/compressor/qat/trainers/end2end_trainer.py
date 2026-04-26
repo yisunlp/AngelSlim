@@ -72,14 +72,58 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
         """Per-token KL(tgt || src)  (shape [N])."""
         return F.kl_div(log_p_src, p_tgt, reduction="none").sum(dim=-1)
 
+    @staticmethod
+    def _shift_for_next_token(
+        student_logits: torch.Tensor,
+        labels: torch.Tensor,
+        teacher_logits: torch.Tensor = None,
+    ):
+        """Shift logits & labels so that ``logits[t]`` predicts ``labels[t+1]``.
+
+        Some HF model implementations (e.g. the ``hy_v3`` family on
+        ``transformers >= 4.57``) do NOT shift labels inside ``forward`` and
+        do NOT honour ``ignore_index=-100``. We perform the shift centrally
+        here so that every loss component agrees on what is being predicted.
+        """
+        s = student_logits[..., :-1, :].contiguous()
+        lab = labels[..., 1:].contiguous()
+        t = teacher_logits[..., :-1, :].contiguous() if teacher_logits is not None else None
+        return s, lab, t
+
+    def _compute_lm_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Standard next-token CE loss with shift + ignore_index=-100.
+
+        Computed in fp32 for numerical stability (matches HF's default).
+        Returns a scalar tensor with grad attached when ``logits`` requires
+        grad. If no valid token is present we return a 0 with grad attached
+        (multiplying ``logits.sum()`` by 0) so DeepSpeed's backward stays
+        happy.
+        """
+        shift_logits, shift_labels, _ = self._shift_for_next_token(logits, labels)
+        # Reshape and run CE with -100 ignored.
+        lm = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)).float(),
+            shift_labels.view(-1).long(),
+            ignore_index=-100,
+            reduction="mean",
+        )
+        if torch.isnan(lm):
+            # No valid label position — keep the graph alive at 0.
+            return logits.sum() * 0.0
+        return lm
+
     def _compute_kd_components(self, student_logits, teacher_logits, labels):
         """Return a dict of per-token KD losses computed only on valid
-        (label != -100) positions. Keys present depend on ``self.loss_type``.
+        (label != -100) positions, AFTER shifting so position ``t``
+        predicts the token at ``t+1``.
 
         Always returns ``forward_kl`` and ``backward_kl`` (useful for
         logging even when the main kd loss is e.g. ``mse`` or a topk
-        variant) — but only when kd_loss_weight > 0.
+        variant).
         """
+        student_logits, labels, teacher_logits = self._shift_for_next_token(
+            student_logits, labels, teacher_logits
+        )
         flat_mask = (labels != -100).reshape(-1)
         if flat_mask.sum() == 0:
             zero = student_logits.new_zeros(())
@@ -147,14 +191,30 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
         return {"loss": kd, "forward_kl": forward_kl, "backward_kl": backward_kl}
 
     def _record(self, name, value):
+        """Record a scalar metric with cross-rank synchronisation.
+
+        We gather the per-rank scalar across the world and store its mean,
+        so that ``log()`` reports the SAME value on every rank — matching
+        the semantics of HF Trainer's built-in ``loss`` key (which is also
+        gathered + averaged before logging). Without this, each rank would
+        only log its own micro-batch's value, easily disagreeing with the
+        global ``loss`` whenever sample difficulty differs across ranks.
+        """
         if value is None:
             return
-        mode = "train" if self.model.training else "eval"
-        v = value.detach().float() if isinstance(value, torch.Tensor) else float(value)
-        if isinstance(v, torch.Tensor):
-            self._qat_metrics[mode][name].append(v.item())
+        if isinstance(value, torch.Tensor):
+            v = value.detach().float()
+            if v.ndim == 0:
+                v = v.reshape(1)
+            try:
+                gathered = self.accelerator.gather_for_metrics(v)
+                scalar = gathered.float().mean().item()
+            except Exception:  # noqa: BLE001
+                scalar = v.mean().item()
         else:
-            self._qat_metrics[mode][name].append(v)
+            scalar = float(value)
+        mode = "train" if self.model.training else "eval"
+        self._qat_metrics[mode][name].append(scalar)
 
     # ------------------------------------------------------------------
     # compute_loss
@@ -174,32 +234,25 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
         if not lm_on and not kd_on:
             raise ValueError("Both lm_loss_weight and kd_loss_weight are 0 — nothing to optimise.")
 
-        # Student forward — always needed.
-        # HF CausalLM loss is computed when ``labels`` is present in inputs.
-        student_inputs = dict(inputs)
-        if not lm_on:
-            # Still need labels for flat_mask; pop from student kwargs to
-            # skip HF's internal CE and save some compute.
-            student_inputs.pop("labels", None)
+        # Student forward — always needed. We DO NOT pass ``labels`` into
+        # the model: some implementations (e.g. transformers' HYV3) ship a
+        # custom in-forward CE that does not shift labels nor honour
+        # ``ignore_index=-100``. Always compute the LM loss ourselves.
+        student_inputs = {k: v for k, v in inputs.items() if k != "labels"}
         outputs = model(**student_inputs)
 
-        lm_loss = outputs.loss if lm_on and getattr(outputs, "loss", None) is not None else None
-        if lm_on and lm_loss is None:
-            raise ValueError(
-                "lm_loss_weight > 0 but model did not return a loss — "
-                "check that ``labels`` is set in the batch."
-            )
+        lm_loss = None
+        if lm_on:
+            if labels is None:
+                raise ValueError("lm_loss_weight > 0 requires ``labels`` in the batch.")
+            lm_loss = self._compute_lm_loss(outputs.logits, labels)
 
         kd_info = None
         if kd_on:
             if labels is None:
                 raise ValueError("kd_loss_weight > 0 requires ``labels`` in the batch.")
             teacher_logits = self.get_ori_outputs(model, inputs).logits
-            kd_info = self._compute_kd_components(
-                outputs.logits,
-                teacher_logits,
-                labels,
-            )
+            kd_info = self._compute_kd_components(outputs.logits, teacher_logits, labels)
 
         # Combine.
         total = outputs.logits.new_zeros(())
@@ -415,7 +468,31 @@ class End2EndTrainer:
     def run(self, dataloader):
         self.prepare_dataset(dataloader)
         self.plugin_manager.call_before_train(train_dataset=self.train_dataset)
+
         self.prepare_trainer()
+
+        # When gradient checkpointing is enabled AND every model weight is
+        # frozen (QAT case: only scale / zero_point are trainable), the
+        # checkpointed backward cannot discover a grad path on its own and
+        # the final logits come back with ``requires_grad=False``. The
+        # standard fix (same one HF applies for PEFT) is to force the input
+        # embedding output to require grad, so the checkpointed layers
+        # re-trace the graph through it.
+        #
+        # IMPORTANT: register the hook AFTER ``prepare_trainer`` because
+        # HF ``gradient_checkpointing_enable`` runs inside
+        # ``trainer.train()`` but before the first compute_loss; the hook
+        # we register here lives on the underlying HF module and survives
+        # DeepSpeed wrapping (DeepSpeed proxies ``forward`` but keeps the
+        # underlying ``nn.Module`` intact).
+        if self.config["compress_config"].QAT.hf_args.get("gradient_checkpointing", False):
+            model = self.quant_model.get_model()
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+                print_info(
+                    "[QAT] enable_input_require_grads() invoked "
+                    "(gradient_checkpointing + frozen base weights)."
+                )
 
         if self.resume_ckpt_dir is not None:
             print_info(f"Loading from resume {self.resume_ckpt_dir}")

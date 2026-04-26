@@ -12,8 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .hunyuan_vl import HunyuanVL  # noqa: F401
-from .qwen3_5 import Qwen3_5  # noqa: F401
-from .qwen3_vl import Qwen3VL  # noqa: F401
-from .qwen3_vl_moe import Qwen3VLMoE  # noqa: F401
-from .qwen_vl import QwenVL  # noqa: F401
+# Each adapter may depend on a specific ``transformers`` version. Fall
+# back to a soft-skip so that a missing VLM module does not break LLM
+# pipelines on older ``transformers`` releases (e.g. 4.57 lacks
+# ``qwen3_5_moe`` / ``qwen3_vl_moe`` / ``qwen3_vl``).
+
+try:
+    from .hunyuan_vl import HunyuanVL  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .qwen3_5 import Qwen3_5  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .qwen3_vl import Qwen3VL  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .qwen3_vl_moe import Qwen3VLMoE  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .qwen_vl import QwenVL  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass

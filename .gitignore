@@ -15,6 +15,7 @@ eval/
 *_ckpt*/
 output/
 outputs/
+output*/
 outs/
 wandb/
 tools/results/

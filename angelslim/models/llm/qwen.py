@@ -17,10 +17,31 @@ import re
 import torch
 import torch.nn as nn
 from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv
-from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-    Qwen3MoeExperts,
-    Qwen3MoeTopKRouter,
-)
+
+# Fused MoE classes (``Qwen3MoeExperts`` / ``Qwen3MoeTopKRouter``) only
+# exist in transformers >= 5.0. On 4.x the MoE block keeps per-expert
+# ``nn.Linear`` modules and these symbols are absent; we fall back to
+# dummy placeholders so that (a) ``isinstance(_, Qwen3MoeExperts)`` in
+# ``replace_moe`` is always False, and (b) the module still imports.
+try:
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+        Qwen3MoeExperts,
+        Qwen3MoeTopKRouter,
+    )
+
+    _HAS_FUSED_QWEN3_MOE = True
+except ImportError:
+
+    class _MissingQwen3MoeExperts:  # pragma: no cover
+        """Sentinel used for isinstance() checks on transformers < 5.0."""
+
+    class _MissingQwen3MoeTopKRouter:  # pragma: no cover
+        """Sentinel for transformers < 5.0 where the router class is
+        inlined inside ``Qwen3MoeSparseMoeBlock``."""
+
+    Qwen3MoeExperts = _MissingQwen3MoeExperts
+    Qwen3MoeTopKRouter = _MissingQwen3MoeTopKRouter
+    _HAS_FUSED_QWEN3_MOE = False
 
 from ...compressor.qat.modules.quantizer import fp8_cast_ste
 from ...compressor.quant.core import PTQSaveVllmHF

@@ -12,12 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .deepseek import DeepSeek  # noqa: F401
-from .glm import GLM  # noqa: F401
-from .hunyuan_dense import HunyuanDense  # noqa: F401
-from .hunyuan_moe import HunyuanMoE  # noqa: F401
-from .hunyuan_v3_moe import HYV3MoE  # noqa: F401
-from .kimi_k2 import KimiK2  # noqa: F401
-from .llama import Llama  # noqa: F401
-from .qwen import Qwen  # noqa: F401
-from .seed_oss import SeedOss  # noqa: F401
+# Each LLM adapter may depend on specific ``transformers`` classes. Fall
+# back to a soft-skip so that an unsupported adapter (e.g. new fused-MoE
+# classes introduced in ``transformers >= 5.0``) does not prevent the
+# rest of the package from importing on older releases.
+
+try:
+    from .deepseek import DeepSeek  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .glm import GLM  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .hunyuan_dense import HunyuanDense  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .hunyuan_moe import HunyuanMoE  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .hunyuan_v3_moe import HYV3MoE  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .kimi_k2 import KimiK2  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .llama import Llama  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .qwen import Qwen  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    from .seed_oss import SeedOss  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass

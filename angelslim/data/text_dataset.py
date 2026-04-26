@@ -114,10 +114,28 @@ class TextDataset(BaseDataset):
         line_count = 0
         with open(data_path, "r") as f:
             for line in f:
+                line = line.strip()
+                if not line:
+                    continue
                 if num_samples > 0 and line_count >= num_samples:
                     break
 
                 data = json.loads(line)
+
+                # Schema dispatch ------------------------------------------------
+                # 1) ``applied_message``: a single string already wrapped with the
+                #    chat template. We tokenize it directly and only supervise
+                #    the tokens AFTER the last assistant marker
+                #    (``<｜hy_Assistant｜>`` or ``<|im_start|>assistant``).
+                # 2) ``messages`` / ``conversations`` / ``input``: structured
+                #    schemas; we run them through ``apply_chat_template`` and
+                #    supervise only the last assistant turn.
+                if "applied_message" in data:
+                    item = self._tokenize_applied_message(data["applied_message"])
+                    if item is not None:
+                        self.data.append(item)
+                        line_count += 1
+                    continue
 
                 # Validate format
                 assert (
@@ -208,6 +226,101 @@ class TextDataset(BaseDataset):
                 )
 
                 line_count += 1
+
+    # ------------------------------------------------------------------
+    # Schema: ``applied_message`` (already chat-templated single string)
+    # ------------------------------------------------------------------
+
+    # Common assistant-turn markers across chat templates we may encounter.
+    # Each entry is matched as a *substring* on the raw text; the FIRST
+    # marker found at the rightmost position (= last assistant turn) wins.
+    # ``include_marker_in_loss=False`` means the marker token itself is
+    # part of the prompt (label = -100); only tokens AFTER it are
+    # supervised.
+    _ASSISTANT_MARKERS = (
+        "<｜hy_Assistant｜>",
+        "<|hy_Assistant|>",
+        "<|im_start|>assistant\n",
+        "<|im_start|>assistant",
+        "<start_of_turn>model\n",
+    )
+
+    def _tokenize_applied_message(self, text: str):
+        """Tokenize a single chat-templated string and build labels that
+        supervise ONLY the last assistant reply.
+
+        Returns ``None`` if no assistant marker is found OR if truncation
+        leaves no supervised token.
+        """
+        # Locate the start of the last assistant turn at the character level.
+        last_idx = -1
+        marker_used = None
+        for marker in self._ASSISTANT_MARKERS:
+            i = text.rfind(marker)
+            if i > last_idx:
+                last_idx = i
+                marker_used = marker
+        if last_idx < 0:
+            return None
+
+        # Char position right AFTER the marker = first supervised character.
+        target_char_start = last_idx + len(marker_used)
+        prompt_text = text[:target_char_start]
+
+        # Tokenize the (full) text; we need ``offset_mapping`` so we can
+        # convert ``target_char_start`` to a token-level index.
+        encoded = self.processor(
+            text,
+            return_tensors="pt",
+            max_length=self.max_length,
+            truncation=True,
+            padding="max_length",
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+        offsets = encoded["offset_mapping"][0]  # [seq, 2]
+
+        # First token whose start_offset >= target_char_start is the first
+        # supervised token. Tokens that the marker itself spans (and any
+        # padding) get -100.
+        prompt_token_count = 0
+        for token_idx, (start, end) in enumerate(offsets.tolist()):
+            if start == 0 and end == 0:
+                # Padding token: keep going; we'll mask later via attention_mask.
+                continue
+            if start >= target_char_start:
+                prompt_token_count = token_idx
+                break
+        else:
+            # Fall through: no token matched — likely the assistant marker
+            # got truncated away. Skip the sample.
+            return None
+
+        if prompt_token_count == 0:
+            # Marker is right at the start (no prompt) or matched at offset 0;
+            # supervise everything after the marker. Use the prompt-only
+            # tokenization length as a safety fallback.
+            prompt_token_count = len(
+                self.processor(
+                    prompt_text, add_special_tokens=False, return_tensors=None
+                )["input_ids"]
+            )
+
+        labels = input_ids.clone()
+        labels[:, :prompt_token_count] = -100
+        labels[attention_mask == 0] = -100
+
+        # If truncation killed every supervised token, skip the sample.
+        if (labels != -100).sum().item() == 0:
+            return None
+
+        return {
+            "input_ids": input_ids.to(self.device),
+            "attention_mask": attention_mask.to(self.device),
+            "labels": labels.to(self.device),
+        }
 
     def _prepare_messages(self, data: Dict) -> List[Dict]:
         """Prepare chat messages from data entry"""
