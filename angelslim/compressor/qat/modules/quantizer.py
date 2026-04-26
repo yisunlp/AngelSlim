@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ....utils import is_deepspeed_zero3_enabled
+from ....utils import is_deepspeed_zero3_enabled, is_zero3_param
 
 FP8_E4M3_QMIN = -448
 FP8_E4M3_QMAX = 448
@@ -51,10 +51,20 @@ def _parse_bits_and_dtype(qtype_str):
 
 
 class Quantizer(nn.Module):
-    def __init__(self, config, quant_info, x=None, is_act=False, resume=False, num_heads=-1):
+    def __init__(
+        self,
+        config,
+        quant_info,
+        x=None,
+        is_act=False,
+        resume=False,
+        num_heads=-1,
+        x_shape=None,
+    ):
         super().__init__()
         self.is_act = is_act
         self.num_heads = num_heads
+        self.x_shape = tuple(x_shape) if x_shape is not None else None
         self.default_scale_value = float(
             config.get("activation_scale_init_value" if is_act else "weight_scale_init_value", 1.0)
         )
@@ -126,7 +136,7 @@ class Quantizer(nn.Module):
                     self._set_quant_parameters(self._default_scale((1,), None), zp)
                 return
 
-            if is_deepspeed_zero3_enabled():
+            if self._needs_default_weight_init(x):
                 scale_shape = self._default_weight_scale_shape(x)
                 zp = self._default_zero_point(scale_shape, x) if not self.is_sym else None
                 self._set_quant_parameters(self._default_scale(scale_shape, x), zp)
@@ -173,10 +183,19 @@ class Quantizer(nn.Module):
             self.sigmoid = nn.Sigmoid()
 
     def _weight_2d_shape(self, x):
-        shape = tuple(getattr(x, "ds_shape", tuple(x.shape)))
+        shape = self.x_shape or tuple(getattr(x, "ds_shape", tuple(x.shape)))
         if len(shape) > 2:
             return shape[0], int(torch.tensor(shape[1:]).prod().item())
         return shape
+
+    def _needs_default_weight_init(self, x):
+        return (
+            is_deepspeed_zero3_enabled()
+            or is_zero3_param(x)
+            or x is None
+            or x.device.type == "meta"
+            or x.numel() == 0
+        )
 
     def _default_weight_scale_shape(self, x):
         out_dim, in_dim = self._weight_2d_shape(x)
@@ -553,7 +572,16 @@ class QuantLinear(nn.Module):
         self.use_weight_quant = use_weight_quant
         self.use_act_quant = use_act_quant
         if self.use_weight_quant:
-            self.weight_quantizer = Quantizer(config, quant_info, x=org_module.weight)
+            weight_shape = (
+                org_module.out_features,
+                org_module.in_features,
+            )
+            self.weight_quantizer = Quantizer(
+                config,
+                quant_info,
+                x=org_module.weight,
+                x_shape=weight_shape,
+            )
         if self.use_act_quant:
             self.act_quantizer = Quantizer(config, quant_info, is_act=True, resume=resume)
 
@@ -567,15 +595,19 @@ class QuantLinear(nn.Module):
             )
 
     def forward(self, input: torch.Tensor):
-        if input.shape[0] == 0:
-            return self.fwd_func(input, self.weight, self.bias)
-
+        weight_dtype = self.weight.dtype
         weight = self.weight_quantizer(self.weight) if self.use_weight_quant else self.weight
+        if weight.dtype != weight_dtype:
+            weight = weight.to(weight_dtype)
         if self.use_act_quant:
             input = self.act_quantizer(input)
+        if input.dtype != weight.dtype:
+            input = input.to(weight.dtype)
         output = self.fwd_func(input, weight, self.bias)
         if self.use_qkv_quant:
             output = self.qkv_quantizer(output)
+            if output.dtype != weight.dtype:
+                output = output.to(weight.dtype)
         return output
 
     def set_quant_state(self, weight_quant=False, act_quant=False, qkv_quant=None):

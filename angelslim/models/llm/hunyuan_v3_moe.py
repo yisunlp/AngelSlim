@@ -25,6 +25,7 @@ from transformers.models.hy_v3.modeling_hy_v3 import (
 )
 
 from ...compressor.quant.core import PTQSaveVllmHF
+from ...utils import is_deepspeed_zero3_enabled
 from ...utils.utils import find_layers, find_parent_layer_and_sub_name
 from ..base_model import BaseLLMModel
 from ..model_factory import SlimModelFactory
@@ -75,6 +76,9 @@ class HYV3ExpertsWithLinear(HYV3Experts):
             # down_proj[i]: [hidden_dim, intermediate_dim]
             expert["down_proj"].weight.data = experts_layer.down_proj[expert_idx]
             setattr(self, f"{expert_idx}", expert)
+
+    def __getitem__(self, idx):
+        return getattr(self, str(idx))
 
     def forward(
         self,
@@ -135,9 +139,22 @@ class HYV3MoE(BaseLLMModel):
         low_cpu_mem_usage=True,
         use_cache=False,
         using_multi_nodes=False,
+        attn_implementation="default",
     ):
         attn_implementation = "eager"
         torch_dtype = torch.bfloat16
+        if is_deepspeed_zero3_enabled():
+            return super().from_pretrained(
+                model_path,
+                torch_dtype=torch_dtype,
+                device_map=device_map,
+                trust_remote_code=trust_remote_code,
+                low_cpu_mem_usage=low_cpu_mem_usage,
+                use_cache=use_cache,
+                using_multi_nodes=using_multi_nodes,
+                attn_implementation=attn_implementation,
+            )
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             attn_implementation=attn_implementation,

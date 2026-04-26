@@ -36,6 +36,32 @@ def _cleanup():
         torch.cuda.empty_cache()
 
 
+def _param_full_shape(param):
+    shape = getattr(param, "ds_shape", None)
+    if shape is None:
+        shape = getattr(param, "shape", None)
+    return tuple(shape) if shape is not None else ()
+
+
+def _infer_expert_intermediate_dim(experts_layer, gate_up, down):
+    gate_up_shape = _param_full_shape(gate_up)
+    down_shape = _param_full_shape(down)
+    gate_up_out = int(gate_up_shape[-2]) if len(gate_up_shape) >= 3 else 0
+    down_in = int(down_shape[-1]) if len(down_shape) >= 3 else 0
+
+    if gate_up_out > 0 and down_in == gate_up_out:
+        return gate_up_out // 2
+    if down_in > 0:
+        return down_in
+    if gate_up_out > 0:
+        return gate_up_out // 2
+
+    intermediate_dim = int(experts_layer.intermediate_dim)
+    if len(gate_up_shape) >= 2 and int(gate_up_shape[-2]) == intermediate_dim:
+        return intermediate_dim // 2
+    return intermediate_dim
+
+
 def is_fused_moe_experts(module):
     required_attrs = (
         "gate_up_proj",
@@ -57,13 +83,13 @@ class LinearizedMoeExperts(nn.Module):
         super().__init__()
         self.num_experts = int(experts_layer.num_experts)
         self.hidden_dim = int(experts_layer.hidden_dim)
-        self.intermediate_dim = int(experts_layer.intermediate_dim)
         self.act_fn = experts_layer.act_fn
         if hasattr(experts_layer, "config"):
             self.config = experts_layer.config
 
         gate_up = experts_layer.gate_up_proj
         down = experts_layer.down_proj
+        self.intermediate_dim = _infer_expert_intermediate_dim(experts_layer, gate_up, down)
         dtype = gate_up.dtype
         device = gate_up.device
         if device.type == "meta":
@@ -102,6 +128,9 @@ class LinearizedMoeExperts(nn.Module):
                     expert["up_proj"].weight.copy_(up_w)
                     expert["down_proj"].weight.copy_(down[expert_idx])
             setattr(self, str(expert_idx), expert)
+
+    def __getitem__(self, idx):
+        return getattr(self, str(idx))
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         final_hidden_states = torch.zeros_like(hidden_states)
@@ -279,7 +308,8 @@ def _load_regular(reader, key, name_to_param, name_to_buffer, loaded_targets):
     if target is None:
         return 0, 1
     src = reader.get_tensor(key) if _rank() == 0 else None
-    _copy_tensor_to_target(src, target, is_buffer=is_buffer)
+    if not _copy_tensor_to_target(src, target, is_buffer=is_buffer, key=key):
+        return 0, 1
     loaded_targets.add(key)
     return 1, 0
 
@@ -300,8 +330,12 @@ def _load_gate_up(reader, key, name_to_param, loaded_targets):
             continue
         gate_src = src[i].chunk(2, dim=-2)[0] if src is not None else None
         up_src = src[i].chunk(2, dim=-2)[1] if src is not None else None
-        _copy_tensor_to_target(gate_src, gate_tgt)
-        _copy_tensor_to_target(up_src, up_tgt)
+        if not _copy_tensor_to_target(gate_src, gate_tgt, key=gate_key):
+            unexpected += 1
+            continue
+        if not _copy_tensor_to_target(up_src, up_tgt, key=up_key):
+            unexpected += 1
+            continue
         loaded_targets.update([gate_key, up_key])
         loaded += 2
     return loaded, unexpected
@@ -320,7 +354,9 @@ def _load_down(reader, key, name_to_param, loaded_targets):
             unexpected += 1
             continue
         down_src = src[i] if src is not None else None
-        _copy_tensor_to_target(down_src, down_tgt)
+        if not _copy_tensor_to_target(down_src, down_tgt, key=down_key):
+            unexpected += 1
+            continue
         loaded_targets.add(down_key)
         loaded += 1
     return loaded, unexpected
@@ -339,8 +375,11 @@ def _infer_num_experts(base, name_to_param):
     return max(expert_ids) + 1 if expert_ids else 0
 
 
-def _copy_tensor_to_target(src, target, is_buffer=False):
+def _copy_tensor_to_target(src, target, is_buffer=False, key=None):
     if is_buffer:
+        if src is not None and target.shape != src.shape:
+            _log_shape_mismatch(key, src, target)
+            return False
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if _rank() == 0:
                 tmp = src.to(device=target.device, dtype=target.dtype)
@@ -350,21 +389,47 @@ def _copy_tensor_to_target(src, target, is_buffer=False):
             target.data.copy_(tmp)
         else:
             target.data.copy_(src.to(device=target.device, dtype=target.dtype))
-        return
+        return True
 
     if (
         torch.distributed.is_available()
         and torch.distributed.is_initialized()
         and not is_zero3_param(target)
     ):
+        if src is not None and target.shape != src.shape:
+            _log_shape_mismatch(key, src, target)
+            return False
         if _rank() == 0:
             tmp = src.to(device=target.device, dtype=target.dtype)
         else:
             tmp = torch.empty_like(target)
         torch.distributed.broadcast(tmp, src=0)
         target.data.copy_(tmp)
-        return
+        return True
 
     with gathered_param_if_zero3(target, modifier_rank=0):
+        ok = True
         if _rank() == 0:
-            target.data.copy_(src.to(device=target.device, dtype=target.dtype))
+            if src.shape != target.shape:
+                _log_shape_mismatch(key, src, target)
+                ok = False
+            else:
+                target.data.copy_(src.to(device=target.device, dtype=target.dtype))
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else target.device
+            )
+            flag = torch.tensor(int(ok), device=device)
+            torch.distributed.broadcast(flag, src=0)
+            ok = bool(flag.item())
+    return ok
+
+
+def _log_shape_mismatch(key, src, target):
+    if _rank() == 0:
+        print_info(
+            f"[zero3_loader] shape mismatch for {key}: "
+            f"checkpoint={tuple(src.shape)}, target={tuple(target.shape)}"
+        )

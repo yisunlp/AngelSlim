@@ -109,7 +109,7 @@ class LearnableScalePlugin(BasePlugin):
         if self.fp8_attn:
             self.quant_model.patch_fp8_attention()
 
-        print_info(self.quant_model.model)
+        #print_info(self.quant_model.model)
 
         if self.from_ptq_ckpt_dir is not None:
             self._load_from_ptq_ckpt(self.from_ptq_ckpt_dir)

@@ -56,13 +56,23 @@ class QATDataset(IterableDataset):
         ]
 
     def _build_from_internal(self, dataset):
-        return [
-            {
-                "input_ids": dataset[i]["input_ids"].tolist()[0],
-                "labels": dataset[i]["labels"].tolist()[0],
-            }
-            for i in range(len(dataset))
-        ]
+        samples = []
+        for i in range(len(dataset)):
+            input_ids = dataset[i]["input_ids"].tolist()[0]
+            labels = list(input_ids)
+
+            item = {"input_ids": input_ids}
+            if "attention_mask" in dataset[i]:
+                attention_mask = dataset[i]["attention_mask"].tolist()[0]
+                labels = [
+                    token_id if mask else -100
+                    for token_id, mask in zip(labels, attention_mask)
+                ]
+                item["attention_mask"] = attention_mask
+
+            item["labels"] = labels
+            samples.append(item)
+        return samples
 
 
 class BlockTrainDataset(Dataset):

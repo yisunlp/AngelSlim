@@ -13,14 +13,15 @@ model:
 compression:
   name: QAT
   quantization:
-    name: fp8_static
+    name: w4a8_fp8
     bits: 8
     quant_method:
-      weight: per-tensor
+      weight: per-group
       activation: per-tensor
-      group_size: -1
+      group_size: 128
     ignore_layers: ["lm_head", "embed_tokens", "gate.weight"]
   QAT:
+    hf_dataset: Salesforce/wikitext,wikitext-2-raw-v1
     from_ptq_ckpt: /apdcephfs_zwfy2/share_301053287/brunosu/all_models/Qwen3-30B-A3B
     require_external_scales_for_zero3: true
     training_mode: end2end
@@ -38,17 +39,17 @@ compression:
         use_activation_quant: true
         use_qkv_quant: false
         skip_lazy_init: true
-        weight_scale_init_value: 1.0
-        activation_scale_init_value: 1.0
+        weight_scale_init_value: 0.1
+        activation_scale_init_value: 0.1
         lazy_init_samples: 0
         learnable:
-          act_scale: true
+          act_scale: false
           weight_scale: true
           kv_scale: false
           norm: false
-          lwc: true
+          lwc: false
         lwc:
-          enable_lwc: true
+          enable_lwc: false
           lwc_init_value: 4.0
           lwc_lr: 0.2
     hf_args:
