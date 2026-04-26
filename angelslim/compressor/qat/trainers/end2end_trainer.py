@@ -18,9 +18,26 @@ from datasets import load_dataset
 from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 
 from ....data.qat_dataset import QATDataset
-from ....utils import print_info
+from ....utils import patch_deepspeed_duplicate_check, print_info
 from ..plugins.learnable_scale import set_quant_state
 from .trainer_factory import TrainerFactory
+
+
+def _unique_named_params(model, predicate):
+    """Collect parameters matching ``predicate`` with id-based de-duplication.
+
+    Some QAT setups share a single scale Parameter across multiple
+    QuantLinear views (e.g. MoE experts built from a shared tensor). HF /
+    DeepSpeed optimizer init rejects duplicates, so we de-dup by ``id``.
+    """
+    seen = set()
+    result = []
+    for name, param in model.named_parameters():
+        if id(param) in seen or not predicate(name, param):
+            continue
+        seen.add(id(param))
+        result.append(param)
+    return result
 
 
 class QATSeq2SeqTrainer(Seq2SeqTrainer):
@@ -173,13 +190,13 @@ class End2EndTrainer:
     def _init_optimizer(self):
         lr = float(self.config["compress_config"].QAT.hf_args.get("learning_rate", 1e-5))
         wd = float(self.config["compress_config"].QAT.hf_args.get("weight_decay", 0))
+        scale_params = _unique_named_params(
+            self.quant_model.model,
+            lambda n, p: p.requires_grad and ("scale" in n or "zero_point" in n),
+        )
         params = [
             {
-                "params": [
-                    p
-                    for n, p in self.quant_model.model.named_parameters()
-                    if "scale" in n or "zero_point" in n
-                ],
+                "params": scale_params,
                 "weight_decay": wd,
                 "lr": lr,
             }
@@ -191,6 +208,7 @@ class End2EndTrainer:
             .get("lwc", {})
             .get("enable_lwc", False)
         )
+        lwc_param_count = 0
         if enable_lwc:
             lwc_lr = float(
                 self.config["compress_config"]
@@ -198,30 +216,42 @@ class End2EndTrainer:
                 .get("lwc", {})
                 .get("lwc_lr", 1e-1)
             )
-            lwc_params = [
-                {
-                    "params": [
-                        p
-                        for n, p in self.quant_model.model.named_parameters()
-                        if "clip_factor_w_max" in n or "clip_factor_w_min" in n
-                    ],
-                    "weight_decay": wd,
-                    "lr": lwc_lr,
-                }
-            ]
-            params.extend(lwc_params)
+            lwc_params = _unique_named_params(
+                self.quant_model.model,
+                lambda n, p: p.requires_grad
+                and ("clip_factor_w_max" in n or "clip_factor_w_min" in n),
+            )
+            lwc_param_count = len(lwc_params)
+            params.append(
+                {"params": lwc_params, "weight_decay": wd, "lr": lwc_lr}
+            )
+
+        if not any(group["params"] for group in params):
+            raise ValueError("QAT optimizer has no trainable parameters.")
 
         self.optimizer = torch.optim.AdamW(params)
         if enable_lwc:
-            print_info(f"Init optimizer with learnable lr={lr} lwc_lr={lwc_lr} weight_decay={wd}")
+            print_info(
+                f"Init optimizer with {len(scale_params)} scale params, "
+                f"{lwc_param_count} lwc params, lr={lr} lwc_lr={lwc_lr} weight_decay={wd}"
+            )
         else:
-            print_info(f"Init optimizer with learnable lr={lr} weight_decay={wd}")
+            print_info(
+                f"Init optimizer with {len(scale_params)} scale params, "
+                f"lr={lr} weight_decay={wd}"
+            )
 
     def prepare_trainer(self):
         if self.training_mode == "blockwise":
             return
         if self.training_mode == "end2end" and self.dist_mode == "hf":
             self._init_optimizer()
+            # When DeepSpeed is used, neutralize its duplicate-parameter
+            # check: it rejects param-groups that share tensors, which our
+            # scale/zero_point setup can legally have (shared tensors
+            # across views). Idempotent and a no-op if deepspeed is absent.
+            if self.config["compress_config"].QAT.hf_args.get("deepspeed") is not None:
+                patch_deepspeed_duplicate_check()
             self.external_trainer = QATSeq2SeqTrainer(
                 model=self.quant_model.model,
                 processing_class=self.quant_model.tokenizer,

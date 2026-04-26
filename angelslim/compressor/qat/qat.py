@@ -17,7 +17,13 @@ import os
 import torch
 from safetensors.torch import save_file
 
-from ...utils import print_info, set_op_by_name
+from ...utils import (
+    gathered_param_if_zero3,
+    model_has_zero3_params,
+    print_info,
+    save_via_model_save_func,
+    set_op_by_name,
+)
 from ..compressor_factory import CompressorFactory
 from ..quant.modules.helper_layer import QDQModule
 from .modules.quantizer import QuantLinear
@@ -57,6 +63,7 @@ class QAT:
                 quant_info=self.quant_info,
                 ignore_layers=self.config["compress_config"].quantization.ignore_layers,
                 resume_ckpt_dir=self.config["compress_config"].QAT.resume_ckpt_dir,
+                from_ptq_ckpt_dir=self.config["compress_config"].QAT.from_ptq_ckpt,
                 config=self.plugin_config.get("quant_config", {}),
                 quant_model=self.quant_model,
             )
@@ -72,6 +79,14 @@ class QAT:
     def run(self, dataloader):
         self.trainer.run(dataloader)
 
+    @staticmethod
+    def _gather_clone(tensor):
+        """Detach + CPU-clone a tensor, gathering if it is a ZeRO-3 shard."""
+        if tensor is None:
+            return None
+        with gathered_param_if_zero3(tensor):
+            return tensor.detach().cpu().clone()
+
     def convert(self):
         if self.save_fmt not in ("real", "real_and_kvcache"):
             return
@@ -86,24 +101,28 @@ class QAT:
         ]
 
         for name, module in quant_linear_modules:
+            weight = self._gather_clone(module.weight)
+            bias = self._gather_clone(getattr(module, "bias", None))
+
             weight_scale = None
             if hasattr(module, "weight_quantizer"):
-                weight_scale = module.weight_quantizer.scale.data.clone()
+                weight_scale = self._gather_clone(module.weight_quantizer.scale)
 
             input_scale = None
             if module.use_act_quant and hasattr(module, "act_quantizer"):
                 act_quantizer = module.act_quantizer
                 if hasattr(act_quantizer, "scale") and act_quantizer.scale is not None:
-                    input_scale = act_quantizer.scale.data.clone()
+                    input_scale = self._gather_clone(act_quantizer.scale)
 
             qdq_module = QDQModule(
                 quant_algo=quant_algo,
-                weight=module.weight,
+                weight=weight,
                 weight_scale=weight_scale,
-                bias=module.bias,
+                bias=bias,
                 group_size=(
                     module.weight_quantizer.group_size
-                    if hasattr(module.weight_quantizer, "group_size")
+                    if hasattr(module, "weight_quantizer")
+                    and hasattr(module.weight_quantizer, "group_size")
                     else 128
                 ),
                 input_scale=input_scale,
@@ -126,7 +145,18 @@ class QAT:
             else:
                 continue
             scale_key = f"{cache_name}.scale"
-            kv_scales[scale_key] = module.qkv_quantizer.scale.data.clone().float().cpu()
+            scale_tensor = self._gather_clone(module.qkv_quantizer.scale)
+            if scale_tensor is not None:
+                kv_scales[scale_key] = scale_tensor.float()
+
+        if model_has_zero3_params(self.quant_model.model):
+            # Only rank0 writes the file.
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized() else 0
+            )
+            if rank != 0:
+                return
 
         os.makedirs(save_path, exist_ok=True)
         out_file = os.path.join(save_path, "kv_cache_scales.safetensors")
@@ -146,7 +176,11 @@ class QAT:
         # "real": save real-quant model via model-specific save function
         elif self.save_fmt == "real":
             save_func = self.quant_model.get_save_func()(self.quant_model)
-            save_func.save(os.path.join(save_path, "final_quant_checkpoint"))
+            save_via_model_save_func(
+                self.quant_model,
+                save_func,
+                os.path.join(save_path, "final_quant_checkpoint"),
+            )
 
         # "save_kvcache_only": only export KV cache scales (kv_cache_scales.safetensors)
         elif self.save_fmt == "save_kvcache_only":
@@ -155,7 +189,11 @@ class QAT:
         # "real_and_kvcache": save real-quant model AND KV cache scales
         elif self.save_fmt == "real_and_kvcache":
             save_func = self.quant_model.get_save_func()(self.quant_model)
-            save_func.save(os.path.join(save_path, "final_quant_checkpoint"))
+            save_via_model_save_func(
+                self.quant_model,
+                save_func,
+                os.path.join(save_path, "final_quant_checkpoint"),
+            )
             self._save_kv_cache_scales(os.path.join(save_path, "final_quant_checkpoint"))
 
         else:
