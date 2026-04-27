@@ -641,13 +641,7 @@ class QuantLinear(nn.Module):
         # autocast) may have cast ``input`` to fp16 even though we run in
         # bf16. Align to the (fake-quantised) weight dtype so F.linear
         # stays consistent.
-        if input.dtype != weight.dtype:
-            input = input.to(weight.dtype)
-        # Disable autocast around the matmul so the DeepSpeed
-        # zero3_linear_wrap wrapper (decorated with ``autocast_custom_fwd``)
-        # does NOT silently re-cast ``input`` back to the autocast dtype.
-        with torch.amp.autocast(device_type="cuda", enabled=False):
-            output = self.fwd_func(input, weight, self.bias)
+        output = self.fwd_func(input.to(self.weight.dtype), weight.to(self.weight.dtype), self.bias)
         if self.use_qkv_quant:
             output = self.qkv_quantizer(output)
         return output
