@@ -43,12 +43,12 @@ compression:
     dist_mode: hf
     save_format: real
     do_train: true
-    loss_type: cakld
-    loss_topk: null
+    loss_type: kl_top[_K]
+    loss_topk: 1000
     kd_temperature: 1.0
     kd_alpha: 0.5
-    lm_loss_weight: 1.0
-    kd_loss_weight: 0.0
+    lm_loss_weight: 0.0
+    kd_loss_weight: 1.0
     plugin_config:
       enable_scale: true
       quant_config:

@@ -323,7 +323,7 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
             if labels is None:
                 raise ValueError("kd_loss_weight > 0 requires ``labels`` in the batch.")
             teacher_logits = self.get_ori_outputs(model, inputs).logits
-            kd_info = self._compute_kd_components(outputs.logits, teacher_logits, labels)
+            kd_info = self._compute_kd_components(outputs.logits, teacher_logits, inputs.get("input_ids".clone(),None))
 
         # Combine.
         total = outputs.logits.new_zeros(())
