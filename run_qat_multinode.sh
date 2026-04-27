@@ -25,7 +25,12 @@
 set -euo pipefail
 
 # ---- conda env + NCCL tuning for multi-host RDMA ----
+# ``init_conda.sh`` appends to variables like ``PYTHONPATH`` that may not
+# exist under a fresh SSH login shell; temporarily relax ``set -u`` while
+# sourcing to avoid "unbound variable" aborts.
+set +u
 source /apdcephfs_zwfy2/share_301053287/brunosu/init_scripts/init_conda.sh
+set -u
 pkill -f "python3 -"
 export PYTORCH_ALLOC_CONF="expandable_segments:True"
 export NCCL_IB_GID_INDEX=3

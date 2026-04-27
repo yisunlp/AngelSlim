@@ -45,10 +45,14 @@ for e in "${NODE_ENTRIES[@]}"; do
     echo "  - ${e}"
 done
 
-# Environment the remote shell needs (NODE_IP_LIST is inherited through
-# the container image, but we forward the training overrides explicitly).
+# Environment the remote shell needs. SSH login shells in the taiji
+# container DO NOT inherit ``NODE_IP_LIST`` / ``HOST_NUM`` / ``HOST_GPU_NUM``
+# (those are only set in the main launcher shell), so we explicitly
+# forward them together with user-supplied overrides.
 REMOTE_ENV=""
-for var in CONFIG MODEL_PATH FROM_PTQ_CKPT SAVE_PATH MASTER_PORT NNODES NPROC_PER_NODE; do
+for var in \
+    NODE_IP_LIST HOST_NUM HOST_GPU_NUM \
+    CONFIG MODEL_PATH FROM_PTQ_CKPT SAVE_PATH MASTER_PORT NNODES NPROC_PER_NODE; do
     if [ -n "${!var:-}" ]; then
         REMOTE_ENV+="${var}=$(printf %q "${!var}") "
     fi

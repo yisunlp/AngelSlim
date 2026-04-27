@@ -48,7 +48,7 @@ compression:
     kd_temperature: 1.0
     kd_alpha: 0.5
     lm_loss_weight: 1.0
-    kd_loss_weight: 100.0
+    kd_loss_weight: 1.0
     plugin_config:
       enable_scale: true
       quant_config:
@@ -58,7 +58,7 @@ compression:
         weight_scale_init_value: 0.1
         activation_scale_init_value: 0.1
         learnable:
-          act_scale: true
+          act_scale: false
           weight_scale: true
           kv_scale: false
           norm: false
@@ -84,6 +84,6 @@ compression:
 dataset:
   name: TextDataset
   data_path: /apdcephfs_zwfy2/share_301053287/brunosu/angelslim_fsdp/apply_message_train_for_quant.json
-  max_seq_length: 8192
+  max_seq_length: 4096
   num_samples: 2560
   batch_size: 1

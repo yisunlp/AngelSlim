@@ -15,12 +15,83 @@
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
+from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, TrainerCallback
 
 from ....data.qat_dataset import QATDataset
 from ....utils import patch_deepspeed_duplicate_check, print_info
 from ..plugins.learnable_scale import set_quant_state
 from .trainer_factory import TrainerFactory
+
+
+class _ProgressLogCallback(TrainerCallback):
+    """Emit a clean one-line progress message on every logging_step.
+
+    HF Trainer ships a tqdm progress bar, but when it is wrapped by a
+    multi-node launcher (e.g. ``deepspeed`` running under ``pdsh``) the
+    carriage returns tqdm relies on get stripped, so the bar degrades
+    into garbled output. This callback prints a rank-0-only progress
+    line alongside the usual ``{'loss': ...}`` dict, guaranteeing a
+    readable progress signal in every environment.
+
+    Also prints elapsed / ETA / step-time so long QAT runs are easy to
+    monitor without tqdm.
+    """
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        """Format a duration like ``1d 03:41:22`` / ``07:12`` / ``44.3s``."""
+        if seconds < 0 or seconds != seconds:  # NaN guard
+            return "?"
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        d, h = divmod(h, 24)
+        if d > 0:
+            return f"{d}d {h:02d}:{m:02d}:{s:02d}"
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        import time
+
+        self._train_start_ts = time.monotonic()
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        if state.is_world_process_zero is False:
+            return
+        import time
+
+        total = state.max_steps if state.max_steps and state.max_steps > 0 else None
+        step = state.global_step
+        parts = [f"step {step}" + (f"/{total}" if total else "")]
+        if total:
+            parts.append(f"{100.0 * step / total:.1f}%")
+        loss = logs.get("loss")
+        if loss is not None:
+            parts.append(f"loss={loss:.4f}")
+        gn = logs.get("grad_norm")
+        if gn is not None:
+            parts.append(f"grad_norm={gn:.3f}")
+        lr = logs.get("learning_rate")
+        if lr is not None:
+            parts.append(f"lr={lr:.2e}")
+
+        # Timing: elapsed since train_begin, average s/step, projected total,
+        # ETA (remaining).
+        start = getattr(self, "_train_start_ts", None)
+        if start is not None and step > 0:
+            elapsed = time.monotonic() - start
+            sec_per_step = elapsed / step
+            parts.append(f"elapsed={self._fmt_duration(elapsed)}")
+            parts.append(f"{sec_per_step:.2f}s/step")
+            if total and total > step:
+                remaining = sec_per_step * (total - step)
+                parts.append(f"eta={self._fmt_duration(remaining)}")
+        print_info("[progress] " + " | ".join(parts))
 
 
 def _unique_named_params(model, predicate):
@@ -448,6 +519,7 @@ class End2EndTrainer:
                 optimizers=(self.optimizer, None),
                 loss_config=self.loss_config,
                 quant_config=self.quant_config,
+                callbacks=[_ProgressLogCallback()],
             )
         else:
             raise NotImplementedError(f"Unsupported distribution mode: {self.dist_mode}")

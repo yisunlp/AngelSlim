@@ -56,13 +56,21 @@ class QATDataset(IterableDataset):
         ]
 
     def _build_from_internal(self, dataset):
-        return [
-            {
-                "input_ids": dataset[i]["input_ids"].tolist()[0],
-                "labels": dataset[i]["labels"].tolist()[0],
-            }
-            for i in range(len(dataset))
-        ]
+        samples = []
+        for i in range(len(dataset)):
+            labels = dataset[i]["labels"].tolist()[0]
+            # Skip samples whose supervised-label mask is all -100 (every
+            # position is "don't compute loss"). These produce NaN / zero
+            # loss and slow training down for no benefit.
+            if all(lab == -100 for lab in labels):
+                continue
+            samples.append(
+                {
+                    "input_ids": dataset[i]["input_ids"].tolist()[0],
+                    "labels": labels,
+                }
+            )
+        return samples
 
 
 class BlockTrainDataset(Dataset):

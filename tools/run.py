@@ -39,6 +39,10 @@ def get_args():
     parser.add_argument("--lm-eval", action="store_true")
     parser.add_argument("--lm-eval-task", nargs="+", default=["ceval-valid"])
     parser.add_argument("--ppl-eval", action="store_true")
+    # ``deepspeed`` launcher injects ``--local_rank`` into every worker;
+    # accept and ignore it (LOCAL_RANK env var is the real source of truth
+    # for our distributed code).
+    parser.add_argument("--local_rank", type=int, default=-1, help=argparse.SUPPRESS)
     args = parser.parse_args()
     return args
 

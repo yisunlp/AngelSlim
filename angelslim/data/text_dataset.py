@@ -249,8 +249,13 @@ class TextDataset(BaseDataset):
         """Tokenize a single chat-templated string and build labels that
         supervise ONLY the last assistant reply.
 
-        Returns ``None`` if no assistant marker is found OR if truncation
-        leaves no supervised token.
+        Returns ``None`` when:
+          * no assistant marker is found in ``text``;
+          * the prompt alone (everything up to and including the last
+            assistant marker) already reaches or exceeds ``self.max_length``
+            tokens, so truncation leaves zero supervised tokens;
+          * after tokenisation no valid label position remains (paranoid
+            fallback).
         """
         # Locate the start of the last assistant turn at the character level.
         last_idx = -1
@@ -267,8 +272,21 @@ class TextDataset(BaseDataset):
         target_char_start = last_idx + len(marker_used)
         prompt_text = text[:target_char_start]
 
-        # Tokenize the (full) text; we need ``offset_mapping`` so we can
-        # convert ``target_char_start`` to a token-level index.
+        # Tokenise the prompt-only prefix independently to get its exact
+        # token length. This is the ground-truth ``prompt_len`` we'll mask.
+        prompt_len = len(
+            self.processor(
+                prompt_text, add_special_tokens=False, return_tensors=None
+            )["input_ids"]
+        )
+
+        # Skip samples whose prompt alone does not fit within max_length
+        # (leaves 0 tokens to supervise). Also require at least one
+        # position >= prompt_len under max_length for the assistant reply.
+        if prompt_len >= self.max_length:
+            return None
+
+        # Tokenise the full sequence with padding + truncation.
         encoded = self.processor(
             text,
             return_tensors="pt",
@@ -276,43 +294,27 @@ class TextDataset(BaseDataset):
             truncation=True,
             padding="max_length",
             add_special_tokens=False,
-            return_offsets_mapping=True,
         )
         input_ids = encoded["input_ids"]
         attention_mask = encoded["attention_mask"]
-        offsets = encoded["offset_mapping"][0]  # [seq, 2]
 
-        # First token whose start_offset >= target_char_start is the first
-        # supervised token. Tokens that the marker itself spans (and any
-        # padding) get -100.
-        prompt_token_count = 0
-        for token_idx, (start, end) in enumerate(offsets.tolist()):
-            if start == 0 and end == 0:
-                # Padding token: keep going; we'll mask later via attention_mask.
-                continue
-            if start >= target_char_start:
-                prompt_token_count = token_idx
-                break
-        else:
-            # Fall through: no token matched — likely the assistant marker
-            # got truncated away. Skip the sample.
+        # Sanity: the first ``prompt_len`` tokens of ``input_ids`` MUST
+        # match the standalone-tokenised prompt. If they don't (e.g.
+        # unusual tokenizer merge across the marker boundary), fall back
+        # to skipping the sample to avoid silently misaligning labels.
+        prompt_ids = self.processor(
+            prompt_text, add_special_tokens=False, return_tensors="pt"
+        )["input_ids"][0]
+        if input_ids.shape[1] < prompt_len or not torch.equal(
+            input_ids[0, :prompt_len], prompt_ids
+        ):
             return None
 
-        if prompt_token_count == 0:
-            # Marker is right at the start (no prompt) or matched at offset 0;
-            # supervise everything after the marker. Use the prompt-only
-            # tokenization length as a safety fallback.
-            prompt_token_count = len(
-                self.processor(
-                    prompt_text, add_special_tokens=False, return_tensors=None
-                )["input_ids"]
-            )
-
         labels = input_ids.clone()
-        labels[:, :prompt_token_count] = -100
+        labels[:, :prompt_len] = -100
         labels[attention_mask == 0] = -100
 
-        # If truncation killed every supervised token, skip the sample.
+        # Must have at least one supervised token after padding/truncation.
         if (labels != -100).sum().item() == 0:
             return None
 
