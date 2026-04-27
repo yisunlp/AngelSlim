@@ -641,7 +641,9 @@ class QuantLinear(nn.Module):
         # autocast) may have cast ``input`` to fp16 even though we run in
         # bf16. Align to the (fake-quantised) weight dtype so F.linear
         # stays consistent.
-        output = self.fwd_func(input.to(self.weight.dtype), weight.to(self.weight.dtype), self.bias)
+        output = self.fwd_func(
+            input.to(self.weight.dtype), weight.to(self.weight.dtype), self.bias
+        )
         if self.use_qkv_quant:
             output = self.qkv_quantizer(output)
         return output
