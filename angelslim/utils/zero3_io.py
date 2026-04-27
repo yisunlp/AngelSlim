@@ -211,7 +211,18 @@ class LinearizedMoeExperts(nn.Module):
         with torch.no_grad():
             expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
             expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            expert_hit_mask = torch.greater(expert_mask.sum(dim=(-1, -2)), 0)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                # ZeRO-3 gathers parameters when a Linear is entered. All ranks must
+                # enter the same experts in the same order even when their local
+                # batches route to different experts, otherwise collectives deadlock.
+                expert_hit_int = expert_hit_mask.to(torch.int32)
+                torch.distributed.all_reduce(
+                    expert_hit_int,
+                    op=torch.distributed.ReduceOp.MAX,
+                )
+                expert_hit_mask = expert_hit_int.to(torch.bool)
+            expert_hit = expert_hit_mask.nonzero()
 
         for expert_idx in expert_hit:
             expert_idx = expert_idx[0]
@@ -219,7 +230,7 @@ class LinearizedMoeExperts(nn.Module):
                 continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
-            expert_layer = getattr(self, str(int(expert_idx)))
+            expert_layer = getattr(self, str(int(expert_idx.item())))
             gate = expert_layer["gate_proj"](current_state)
             up = expert_layer["up_proj"](current_state)
             current_hidden_states = self.act_fn(gate) * up
