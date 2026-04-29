@@ -14,13 +14,16 @@
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import re
 import shutil
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import torch
-from safetensors.torch import safe_open, save_file
+from safetensors.torch import load_file, save_file
 
 
 EXPERT_WEIGHT_RE = re.compile(
@@ -99,6 +102,15 @@ def parse_args():
         type=int,
         default=None,
         help="Override num_experts. Defaults to config/index inference.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of safetensors shards to convert in parallel. "
+            "Use 1 if host memory or filesystem bandwidth is limited."
+        ),
     )
     return parser.parse_args()
 
@@ -260,23 +272,13 @@ def put_tensor(state_dict, key, tensor):
     state_dict[key] = tensor
 
 
-def pack_layer_experts(reader, key_set, layer, num_experts):
+def pack_layer_experts(source_state, key_set, layer, num_experts):
     prefix = f"model.layers.{layer}.mlp.experts"
-    down0 = reader.get_tensor(f"{prefix}.0.down_proj.weight")
-    gate0 = reader.get_tensor(f"{prefix}.0.gate_proj.weight")
-    up0 = reader.get_tensor(f"{prefix}.0.up_proj.weight")
-    down_shape = down0.shape
-    gate_shape = gate0.shape
-    up_shape = up0.shape
-
-    if gate_shape != up_shape:
-        raise ValueError(f"Layer {layer}: gate_proj and up_proj shapes differ")
-
-    down = torch.empty((num_experts, *down_shape), dtype=down0.dtype)
-    gate_up = torch.empty(
-        (num_experts, gate_shape[0] + up_shape[0], gate_shape[1]),
-        dtype=gate0.dtype,
-    )
+    down_tensors = []
+    gate_up_tensors = []
+    down_shape = None
+    gate_shape = None
+    up_shape = None
 
     for expert_id in range(num_experts):
         down_key = f"{prefix}.{expert_id}.down_proj.weight"
@@ -286,54 +288,72 @@ def pack_layer_experts(reader, key_set, layer, num_experts):
         if missing_keys:
             raise KeyError(f"Layer {layer}: missing expert tensors: {missing_keys[:3]}")
 
-        down_tensor = reader.get_tensor(down_key)
-        gate_tensor = reader.get_tensor(gate_key)
-        up_tensor = reader.get_tensor(up_key)
-        if down_tensor.shape != down_shape:
+        down_tensor = source_state[down_key]
+        gate_tensor = source_state[gate_key]
+        up_tensor = source_state[up_key]
+
+        if expert_id == 0:
+            down_shape = down_tensor.shape
+            gate_shape = gate_tensor.shape
+            up_shape = up_tensor.shape
+            if gate_shape != up_shape:
+                raise ValueError(f"Layer {layer}: gate_proj and up_proj shapes differ")
+        elif down_tensor.shape != down_shape:
             raise ValueError(f"{down_key}: shape {tuple(down_tensor.shape)} != {tuple(down_shape)}")
-        if gate_tensor.shape != gate_shape or up_tensor.shape != up_shape:
+        elif gate_tensor.shape != gate_shape or up_tensor.shape != up_shape:
             raise ValueError(f"Layer {layer}, expert {expert_id}: inconsistent gate/up shape")
 
-        down[expert_id].copy_(down_tensor)
-        gate_up[expert_id, : gate_shape[0]].copy_(gate_tensor)
-        gate_up[expert_id, gate_shape[0] :].copy_(up_tensor)
+        down_tensors.append(down_tensor)
+        gate_up_tensors.append(torch.cat((gate_tensor, up_tensor), dim=0))
 
     return {
-        f"{prefix}.down_proj": down,
-        f"{prefix}.gate_up_proj": gate_up,
+        f"{prefix}.down_proj": torch.stack(down_tensors, dim=0),
+        f"{prefix}.gate_up_proj": torch.stack(gate_up_tensors, dim=0),
     }
 
 
-def convert_shard(input_path, output_path, shard_name, num_experts):
+def convert_shard(input_path, output_path, shard_name, num_experts, progress_label=None):
+    start_time = time.time()
     input_file = input_path / shard_name
     output_file = output_path / shard_name
     temp_file = output_file.with_suffix(output_file.suffix + ".tmp")
     state_dict = {}
 
-    with safe_open(input_file, framework="pt", device="cpu") as reader:
-        keys = list(reader.keys())
-        key_set = set(keys)
-        expert_layers = sorted(
-            {int(match.group(1)) for key in keys if (match := EXPERT_WEIGHT_RE.match(key))}
-        )
+    if progress_label:
+        print(f"{progress_label} loading {shard_name}", flush=True)
+    source_state = load_file(str(input_file), device="cpu")
+    keys = list(source_state)
+    key_set = set(keys)
+    expert_layers = sorted(
+        {int(match.group(1)) for key in keys if (match := EXPERT_WEIGHT_RE.match(key))}
+    )
 
-        for key in keys:
-            if EXPERT_WEIGHT_RE.match(key):
-                continue
-            put_tensor(state_dict, rename_key(key), reader.get_tensor(key))
+    if progress_label:
+        print(f"{progress_label} packing {shard_name}", flush=True)
+    for key in keys:
+        if EXPERT_WEIGHT_RE.match(key):
+            continue
+        put_tensor(state_dict, rename_key(key), source_state[key])
 
-        for layer in expert_layers:
-            for packed_key, packed_tensor in pack_layer_experts(
-                reader, key_set, layer, num_experts
-            ).items():
-                put_tensor(state_dict, packed_key, packed_tensor)
+    for layer in expert_layers:
+        for packed_key, packed_tensor in pack_layer_experts(
+            source_state, key_set, layer, num_experts
+        ).items():
+            put_tensor(state_dict, packed_key, packed_tensor)
 
-    save_file(state_dict, temp_file)
+    if progress_label:
+        print(f"{progress_label} saving {shard_name}", flush=True)
+    save_file(state_dict, str(temp_file))
     os.replace(temp_file, output_file)
 
     shard_index = {key: shard_name for key in state_dict}
     shard_nbytes = sum(tensor_nbytes(tensor) for tensor in state_dict.values())
-    return shard_index, shard_nbytes
+    elapsed = time.time() - start_time
+    return shard_name, shard_index, shard_nbytes, elapsed
+
+
+def convert_shard_worker(args):
+    return convert_shard(*args)
 
 
 def prepare_output_dir(input_path, output_path, overwrite):
@@ -379,11 +399,38 @@ def main():
     output_weight_map = {}
     total_size = 0
     shards = list_shards(source_weight_map)
-    for idx, shard_name in enumerate(shards, 1):
-        print(f"[{idx}/{len(shards)}] converting {shard_name}", flush=True)
-        shard_index, shard_nbytes = convert_shard(input_path, output_path, shard_name, num_experts)
-        output_weight_map.update(shard_index)
-        total_size += shard_nbytes
+    if args.num_workers <= 1:
+        for idx, shard_name in enumerate(shards, 1):
+            progress_label = f"[{idx}/{len(shards)}]"
+            shard_name, shard_index, shard_nbytes, elapsed = convert_shard(
+                input_path, output_path, shard_name, num_experts, progress_label
+            )
+            output_weight_map.update(shard_index)
+            total_size += shard_nbytes
+            print(f"{progress_label} done {shard_name} in {elapsed:.1f}s", flush=True)
+    else:
+        max_workers = min(args.num_workers, len(shards))
+        done_count = 0
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=mp.get_context("spawn"),
+        ) as executor:
+            futures = [
+                executor.submit(
+                    convert_shard_worker,
+                    (input_path, output_path, shard_name, num_experts, None),
+                )
+                for shard_name in shards
+            ]
+            for future in as_completed(futures):
+                shard_name, shard_index, shard_nbytes, elapsed = future.result()
+                output_weight_map.update(shard_index)
+                total_size += shard_nbytes
+                done_count += 1
+                print(
+                    f"[{done_count}/{len(shards)}] done {shard_name} in {elapsed:.1f}s",
+                    flush=True,
+                )
 
     write_index(output_path, output_weight_map, total_size)
     print(f"Done. Wrote Transformers 5.x checkpoint to {output_path}")
