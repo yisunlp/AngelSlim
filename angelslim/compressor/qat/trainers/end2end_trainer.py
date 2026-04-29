@@ -13,12 +13,12 @@
 # limitations under the License.
 
 import torch
-import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 
 from ....data.qat_dataset import QATDataset
 from ....utils import patch_deepspeed_duplicate_check, print_info
+from ..plugins.distill_loss import DistillLoss
 from ..plugins.learnable_scale import set_quant_state
 from .trainer_factory import TrainerFactory
 
@@ -54,6 +54,11 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
         self.kd_alpha = float(loss_config.get("kd_alpha", 0.5))
         self.lm_loss_weight = float(loss_config.get("lm_loss_weight", 1.0))
         self.kd_loss_weight = float(loss_config.get("kd_loss_weight", 0.0))
+        self.distill_loss = DistillLoss(
+            loss_type=self.loss_type,
+            loss_topk=self.loss_topk,
+            kd_temperature=self.kd_temperature,
+        )
         self.use_weight_quant = quant_config.get("use_weight_quant", False)
         self.use_activation_quant = quant_config.get("use_activation_quant", False)
         self.use_qkv_quant = quant_config.get("use_qkv_quant", False)
@@ -62,89 +67,6 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
         from collections import defaultdict
 
         self._qat_metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
-
-    # ------------------------------------------------------------------
-    # KD loss helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _kl_per_token(log_p_src: torch.Tensor, p_tgt: torch.Tensor) -> torch.Tensor:
-        """Per-token KL(tgt || src)  (shape [N])."""
-        return F.kl_div(log_p_src, p_tgt, reduction="none").sum(dim=-1)
-
-    def _compute_kd_components(self, student_logits, teacher_logits, labels):
-        """Return a dict of per-token KD losses computed only on valid
-        (label != -100) positions. Keys present depend on ``self.loss_type``.
-
-        Always returns ``forward_kl`` and ``backward_kl`` (useful for
-        logging even when the main kd loss is e.g. ``mse`` or a topk
-        variant) — but only when kd_loss_weight > 0.
-        """
-        flat_mask = (labels != -100).reshape(-1)
-        if flat_mask.sum() == 0:
-            zero = student_logits.new_zeros(())
-            return {"loss": zero, "forward_kl": zero, "backward_kl": zero}
-
-        # Flatten to [N, V] and keep only valid tokens.
-        s_flat = student_logits.flatten(0, -2)[flat_mask]
-        t_flat = teacher_logits.flatten(0, -2)[flat_mask]
-        valid_labels = labels.reshape(-1)[flat_mask]
-
-        # Diagnostic KL (always computed at T=1 on valid tokens).
-        s_logp = F.log_softmax(s_flat, dim=-1)
-        t_logp = F.log_softmax(t_flat, dim=-1)
-        s_p = s_logp.exp()
-        t_p = t_logp.exp()
-        forward_kl = self._kl_per_token(s_logp, t_p).mean()
-        backward_kl = self._kl_per_token(t_logp, s_p).mean()
-
-        # Main KD loss according to loss_type.
-        if self.loss_type == "kl":
-            kd = forward_kl
-        elif self.loss_type == "rkl":
-            kd = backward_kl
-        elif self.loss_type == "mse":
-            kd = F.mse_loss(s_flat, t_flat)
-        elif self.loss_type == "kd":
-            # Legacy "kd": temperature-scaled forward KL. Combined loss is
-            # (alpha*T^2)*KD + (1-alpha)*lm — but we now rely on
-            # lm/kd_loss_weight for the outer combination, so return just
-            # the scaled KL here.
-            T = max(self.kd_temperature, 1e-6)
-            kd = self._kl_per_token(
-                F.log_softmax(s_flat / T, dim=-1),
-                F.softmax(t_flat / T, dim=-1),
-            ).mean() * (T * T)
-        elif self.loss_type == "cakld":
-            # Contextual Asymmetric KL-divergence: per-token mixing of
-            # forward / reverse KL by teacher's confidence on the label.
-            per_tok_fkl = self._kl_per_token(s_logp, t_p)
-            per_tok_bkl = self._kl_per_token(t_logp, s_p)
-            conf = torch.gather(t_p, dim=-1, index=valid_labels.unsqueeze(-1)).squeeze(-1)  # [N]
-            kd = (conf * per_tok_bkl + (1.0 - conf) * per_tok_fkl).mean()
-        elif self._is_reverse_topk_loss(self.loss_type):
-            topk = self._resolve_topk(self.loss_type, s_flat.size(-1))
-            top_s, idx = s_flat.topk(topk, dim=-1, sorted=False)
-            top_t = t_flat.gather(-1, idx)
-            kd = self._kl_per_token(
-                F.log_softmax(top_t, dim=-1),
-                F.softmax(top_s, dim=-1),
-            ).mean()
-        elif self._is_forward_topk_loss(self.loss_type):
-            topk = self._resolve_topk(self.loss_type, t_flat.size(-1))
-            top_t, idx = t_flat.topk(topk, dim=-1, sorted=False)
-            top_s = s_flat.gather(-1, idx)
-            kd = self._kl_per_token(
-                F.log_softmax(top_s, dim=-1),
-                F.softmax(top_t, dim=-1),
-            ).mean()
-        else:
-            raise ValueError(
-                f"Unsupported QAT kd loss_type: {self.loss_type}. "
-                "Valid: kl, rkl, mse, kd, cakld, kl_top[_K], r_kl_top[_K]."
-            )
-
-        return {"loss": kd, "forward_kl": forward_kl, "backward_kl": backward_kl}
 
     def _record(self, name, value):
         if value is None:
@@ -195,7 +117,7 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
             if labels is None:
                 raise ValueError("kd_loss_weight > 0 requires ``labels`` in the batch.")
             teacher_logits = self.get_ori_outputs(model, inputs).logits
-            kd_info = self._compute_kd_components(
+            kd_info = self.distill_loss.compute(
                 outputs.logits,
                 teacher_logits,
                 labels,
@@ -222,25 +144,6 @@ class QATSeq2SeqTrainer(Seq2SeqTrainer):
         self._record("total_loss", total)
 
         return (total, outputs) if return_outputs else total
-
-    @staticmethod
-    def _is_forward_topk_loss(loss_type):
-        return loss_type.startswith("kl_top")
-
-    @staticmethod
-    def _is_reverse_topk_loss(loss_type):
-        return loss_type.startswith("r_kl_top") or loss_type.startswith("rkl_top")
-
-    def _resolve_topk(self, loss_type, vocab_size):
-        topk = self.loss_topk
-        if topk is None and "_top_" in loss_type:
-            topk = int(loss_type.rsplit("_", 1)[-1])
-        if topk is None:
-            topk = 1000
-        topk = int(topk)
-        if topk <= 0:
-            raise ValueError(f"loss_topk must be positive, got: {topk}")
-        return min(topk, vocab_size)
 
     @torch.no_grad()
     def get_ori_outputs(self, model, inputs):
