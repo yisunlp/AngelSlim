@@ -112,6 +112,7 @@ def multi_nodes_run(config):
             shuffle=dataset_config.shuffle,
             inference_settings=dataset_config.inference_settings,
             use_audio_in_video=model_config.use_audio_in_video,
+            is_sft_data=dataset_config.is_sft_data,
         )
 
     # Step 6: Initialize compressor
@@ -362,6 +363,7 @@ def run(config):
             use_audio_in_video=model_config.use_audio_in_video,
             model_name=model_config.name,
             quantization_config=compress_config.quantization,
+            is_sft_data=dataset_config.is_sft_data,
         )
 
     # Step 5: Initialize compressor

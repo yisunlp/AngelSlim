@@ -34,8 +34,10 @@ class TextDataset(BaseDataset):
         device: str = "cpu",
         max_length: int = 4096,
         num_samples: int = -1,
+        is_sft_data: bool = False,
     ):
         super().__init__(processor, device, max_length)
+        self.is_sft_data = is_sft_data
         self._load_data(data_path, num_samples)
 
     def _load_data(self, data_path: str, num_samples: int):
@@ -195,7 +197,8 @@ class TextDataset(BaseDataset):
                 input_ids = model_inputs["input_ids"]
                 attention_mask = model_inputs["attention_mask"]
                 labels = input_ids.clone()
-                labels[:, :prompt_len] = -100
+                if self.is_sft_data:
+                    labels[:, :prompt_len] = -100
                 # Also mask padding tokens.
                 labels[attention_mask == 0] = -100
 

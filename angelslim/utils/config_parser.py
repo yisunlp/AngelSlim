@@ -185,6 +185,7 @@ class DatasetConfig:
     batch_size: int = field(default=1)
     shuffle: bool = field(default=False)
     inference_settings: Optional[Dict[str, Any]] = field(default=None)
+    is_sft_data: bool = field(default=False)
 
 
 @dataclass

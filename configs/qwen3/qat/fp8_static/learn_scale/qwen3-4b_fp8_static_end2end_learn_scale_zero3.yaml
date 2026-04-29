@@ -70,3 +70,4 @@ dataset:
   max_seq_length: 512
   num_samples: 16
   batch_size: 1
+  is_sft_data: true
