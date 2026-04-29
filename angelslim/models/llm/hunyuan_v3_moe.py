@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
 
 import torch
@@ -25,7 +26,7 @@ from transformers.models.hy_v3.modeling_hy_v3 import (
 )
 
 from ...compressor.quant.core import PTQSaveVllmHF
-from ...utils import is_deepspeed_zero3_enabled
+from ...utils import LinearizedMoeExperts, is_deepspeed_zero3_enabled
 from ...utils.utils import find_layers, find_parent_layer_and_sub_name
 from ..base_model import BaseLLMModel
 from ..model_factory import SlimModelFactory
@@ -58,6 +59,237 @@ def _patch_hyv3_router_for_zero3():
 
     HYV3TopKRouter.forward = patched_forward
     HYV3TopKRouter._angelslim_zero3_dtype_patch = True
+
+
+def _group_gemm_enabled() -> bool:
+    return os.environ.get("ANGELSLIM_HYV3_MOE_GROUP_GEMM", "1").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def _can_use_grouped_mm(hidden_states: torch.Tensor) -> bool:
+    return (
+        _group_gemm_enabled()
+        and hasattr(torch.nn.functional, "grouped_mm")
+        and hidden_states.is_cuda
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+    )
+
+
+def _is_zero3_leaf_module(module: nn.Module) -> bool:
+    return bool(getattr(module, "_z3_leaf", False))
+
+
+def _get_expert_module(module: nn.Module, expert_idx: int) -> nn.Module:
+    return getattr(module, str(int(expert_idx)))
+
+
+def _projection_weight(projection: nn.Module) -> torch.Tensor:
+    if getattr(projection, "use_weight_quant", False) and hasattr(projection, "weight_quantizer"):
+        return projection.weight_quantizer(projection.weight)
+    return projection.weight
+
+
+def _projection_input(projection: nn.Module, input_tensor: torch.Tensor) -> torch.Tensor:
+    if getattr(projection, "use_act_quant", False) and hasattr(projection, "act_quantizer"):
+        input_tensor = projection.act_quantizer(input_tensor)
+    return input_tensor.to(projection.weight.dtype)
+
+
+def _grouped_projection(
+    ordered_input: torch.Tensor,
+    projections,
+    offsets: torch.Tensor,
+    counts_list,
+) -> torch.Tensor:
+    if ordered_input.numel() == 0:
+        out_features = projections[0].weight.shape[0]
+        return ordered_input.new_empty((0, out_features))
+
+    input_chunks = ordered_input.split(counts_list, dim=0)
+    quantized_inputs = []
+    for chunk, projection in zip(input_chunks, projections):
+        # Keep ZeRO-3's submodule traversal identical across ranks. Some
+        # experts are hit globally but have zero local tokens, and their
+        # quantizers still need to be entered in the same order.
+        quantized_inputs.append(_projection_input(projection, chunk))
+    grouped_input = torch.cat(quantized_inputs, dim=0).contiguous()
+
+    weights = [_projection_weight(projection).to(projection.weight.dtype).t() for projection in projections]
+    grouped_weight = torch.stack(weights, dim=0).contiguous()
+
+    biases = [getattr(projection, "bias", None) for projection in projections]
+    grouped_bias = None
+    if any(bias is not None for bias in biases):
+        grouped_bias = torch.stack(
+            [
+                bias.to(projection.weight.dtype)
+                if bias is not None
+                else torch.zeros(
+                    projection.weight.shape[0],
+                    dtype=projection.weight.dtype,
+                    device=projection.weight.device,
+                )
+                for bias, projection in zip(biases, projections)
+            ],
+            dim=0,
+        ).contiguous()
+
+    return torch.nn.functional.grouped_mm(
+        grouped_input,
+        grouped_weight,
+        offs=offsets,
+        bias=grouped_bias,
+    )
+
+
+def _expert_hit_mask(
+    flat_expert_index: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    expert_hit_mask = torch.bincount(flat_expert_index, minlength=num_experts) > 0
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        # ZeRO-3 parameter gathers are collectives. Every rank must gather the
+        # same expert weights in the same order, including experts only used by
+        # another rank's local batch.
+        expert_hit_int = expert_hit_mask.to(torch.int32)
+        torch.distributed.all_reduce(expert_hit_int, op=torch.distributed.ReduceOp.MAX)
+        expert_hit_mask = expert_hit_int.to(torch.bool)
+    return expert_hit_mask
+
+
+def _loop_experts_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    final_hidden_states = torch.zeros_like(hidden_states)
+    with torch.no_grad():
+        expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=module.num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        expert_hit_mask = torch.greater(expert_mask.sum(dim=(-1, -2)), 0)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            expert_hit_int = expert_hit_mask.to(torch.int32)
+            torch.distributed.all_reduce(expert_hit_int, op=torch.distributed.ReduceOp.MAX)
+            expert_hit_mask = expert_hit_int.to(torch.bool)
+        expert_hit = expert_hit_mask.nonzero()
+
+    for expert_idx in expert_hit:
+        expert_idx = expert_idx[0]
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[token_idx]
+        expert_layer = _get_expert_module(module, int(expert_idx.item()))
+        gate = expert_layer["gate_proj"](current_state)
+        up = expert_layer["up_proj"](current_state)
+        current_hidden_states = module.act_fn(gate) * up
+        current_hidden_states = expert_layer["down_proj"](current_hidden_states)
+        current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+        final_hidden_states.index_add_(
+            0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
+        )
+
+    return final_hidden_states
+
+
+def _grouped_gemm_experts_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    if is_deepspeed_zero3_enabled() and not _is_zero3_leaf_module(module):
+        return _loop_experts_forward(module, hidden_states, top_k_index, top_k_weights)
+    if not _can_use_grouped_mm(hidden_states):
+        return _loop_experts_forward(module, hidden_states, top_k_index, top_k_weights)
+
+    num_tokens = hidden_states.shape[0]
+    flat_expert_index = top_k_index.reshape(-1).to(torch.long)
+    flat_top_k_weights = top_k_weights.reshape(-1)
+    flat_token_index = (
+        torch.arange(num_tokens, device=hidden_states.device, dtype=torch.long)
+        .unsqueeze(1)
+        .expand_as(top_k_index)
+        .reshape(-1)
+    )
+
+    with torch.no_grad():
+        expert_hit_mask = _expert_hit_mask(flat_expert_index, module.num_experts)
+        expert_ids = expert_hit_mask.nonzero(as_tuple=False).flatten()
+
+    if expert_ids.numel() == 0:
+        return torch.zeros_like(hidden_states)
+
+    expert_ids_list = [int(expert_idx) for expert_idx in expert_ids.detach().cpu().tolist()]
+    group_id_map = torch.empty(module.num_experts, device=hidden_states.device, dtype=torch.long)
+    group_id_map[expert_ids] = torch.arange(
+        expert_ids.numel(), device=hidden_states.device, dtype=torch.long
+    )
+    flat_group_index = group_id_map[flat_expert_index]
+    sorted_group_index, order = torch.sort(flat_group_index)
+    sorted_token_index = flat_token_index[order]
+    sorted_top_k_weights = flat_top_k_weights[order]
+
+    counts = torch.bincount(sorted_group_index, minlength=expert_ids.numel())
+    offsets = torch.cumsum(counts, dim=0).to(torch.int32)
+    counts_list = [int(count) for count in counts.detach().cpu().tolist()]
+    ordered_input = hidden_states[sorted_token_index].contiguous()
+
+    gate_projections = [
+        _get_expert_module(module, expert_idx)["gate_proj"] for expert_idx in expert_ids_list
+    ]
+    up_projections = [_get_expert_module(module, expert_idx)["up_proj"] for expert_idx in expert_ids_list]
+    gate = _grouped_projection(ordered_input, gate_projections, offsets, counts_list)
+    up = _grouped_projection(ordered_input, up_projections, offsets, counts_list)
+    current_hidden_states = module.act_fn(gate) * up
+
+    down_projections = [
+        _get_expert_module(module, expert_idx)["down_proj"] for expert_idx in expert_ids_list
+    ]
+    current_hidden_states = _grouped_projection(
+        current_hidden_states.contiguous(),
+        down_projections,
+        offsets,
+        counts_list,
+    )
+
+    current_hidden_states = current_hidden_states * sorted_top_k_weights[:, None]
+    final_hidden_states = torch.zeros_like(hidden_states)
+    final_hidden_states.index_add_(
+        0, sorted_token_index, current_hidden_states.to(final_hidden_states.dtype)
+    )
+    return final_hidden_states
+
+
+def _patch_linearized_moe_group_gemm():
+    if getattr(LinearizedMoeExperts, "_angelslim_hyv3_group_gemm_patch", False):
+        return
+
+    def patched_forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return _grouped_gemm_experts_forward(self, hidden_states, top_k_index, top_k_weights)
+
+    LinearizedMoeExperts.forward = patched_forward
+    LinearizedMoeExperts._angelslim_hyv3_group_gemm_patch = True
+
+
+def _mark_zero3_moe_leaf_modules(model: nn.Module):
+    if not is_deepspeed_zero3_enabled() or not _group_gemm_enabled():
+        return
+
+    try:
+        from deepspeed.utils import set_z3_leaf_modules
+    except Exception:  # noqa: BLE001
+        return
+
+    set_z3_leaf_modules(model, [LinearizedMoeExperts, HYV3ExpertsWithLinear], raise_if_not_found=False)
 
 
 class HYV3ExpertsWithLinear(HYV3Experts):
@@ -112,31 +344,7 @@ class HYV3ExpertsWithLinear(HYV3Experts):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            expert_layer = getattr(self, f"{expert_idx}")
-            gate = expert_layer["gate_proj"](current_state)
-            up = expert_layer["up_proj"](current_state)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = expert_layer["down_proj"](current_hidden_states)
-            current_hidden_states = (
-                current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            )
-            final_hidden_states.index_add_(
-                0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
-            )
-
-        return final_hidden_states
+        return _grouped_gemm_experts_forward(self, hidden_states, top_k_index, top_k_weights)
 
 
 @SlimModelFactory.register
@@ -165,8 +373,11 @@ class HYV3MoE(BaseLLMModel):
         low_cpu_mem_usage=True,
         use_cache=False,
         using_multi_nodes=False,
+        attn_implementation=None,
     ):
-        attn_implementation = "eager"
+        attn_implementation = attn_implementation or os.environ.get(
+            "ANGELSLIM_HYV3_ATTN_IMPL", "sdpa"
+        )
         torch_dtype = torch.bfloat16
         if is_deepspeed_zero3_enabled():
             _patch_hyv3_router_for_zero3()
@@ -181,6 +392,8 @@ class HYV3MoE(BaseLLMModel):
             using_multi_nodes=using_multi_nodes,
             attn_implementation=attn_implementation,
         )
+        _patch_linearized_moe_group_gemm()
+        _mark_zero3_moe_leaf_modules(self.model)
 
     def replace_moe(self):
         """Replace HYV3Experts instances with HYV3ExpertsWithLinear.
@@ -197,6 +410,7 @@ class HYV3MoE(BaseLLMModel):
 
     def init_ptq(self, slim_config):
         self.replace_moe()
+        _mark_zero3_moe_leaf_modules(self.model)
         super().init_ptq(slim_config)
 
     def get_observer_layers(self):

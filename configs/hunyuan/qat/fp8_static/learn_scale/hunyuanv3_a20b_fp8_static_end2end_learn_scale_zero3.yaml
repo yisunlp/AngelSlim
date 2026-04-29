@@ -3,7 +3,7 @@ global:
 
 model:
   name: HYV3MoE
-  model_path: tencent/Hy3-preview
+  model_path: /apdcephfs_zwfy2/share_301053287/brunosu/all_models/hy3_0_a3b_hf5
   trust_remote_code: true
   torch_dtype: auto
   device_map: None
@@ -21,7 +21,7 @@ compression:
     ignore_layers: ["lm_head", "embed_tokens", "gate.weight"]
   QAT:
     hf_dataset: null
-    from_ptq_ckpt: ./output_ptq_hy3/hunyuanv3_a20b_fp8_static
+    from_ptq_ckpt: ./output_ptq_hy3/hy3_a3b_fp8_static
     training_mode: end2end
     dist_mode: hf
     save_format: real
@@ -67,6 +67,6 @@ compression:
 dataset:
   name: TextDataset
   data_path: ./dataset/sharegpt_gpt4/sharegpt_gpt4_256.jsonl
-  max_seq_length: 2048
+  max_seq_length: 16384
   num_samples: 256
   batch_size: 1
