@@ -45,6 +45,7 @@ A more accessible, comprehensive, and efficient toolkit for large model compress
 ## 🌟Key Features
 
 - **Highly Integrated**: This toolkit integrates mainstream compression algorithms into a unified framework, offering developers one-click access with exceptional ease of use.
+- **Distillation Ready**: AngelSlim supports teacher-student distillation for full-precision students and quantized QAT-style students.
 - **Continuous Innovation**: Beyond integrating widely-used industry algorithms, we are continuously researching better compression algorithms, which will be gradually open-sourced in the future.
 - **Performance-Driven**: We continuously optimize end-to-end performance in model compression workflows and algorithm deployment, such as enabling quantization of models like Qwen3-235B and DeepSeek-R1 on a single GPU.
 
