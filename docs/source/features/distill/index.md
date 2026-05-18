@@ -65,6 +65,45 @@ compression:
       enable_scale: true
 ```
 
+## Example 3: Distill with Special Weight Quantizers
+
+The special weight quantizer path keeps the standard `QuantLinear` wrapper and switches only the weight quantizer implementation through config. Six demo configs are provided:
+
+```text
+configs/qwen3/distill/special/qwen3-1_7b_sherry_distill_from_qwen3-4b_zero2.yaml
+configs/qwen3/distill/special/qwen3-1_7b_absmean_distill_from_qwen3-4b_zero2.yaml
+configs/qwen3/distill/special/qwen3-1_7b_twn_distill_from_qwen3-4b_zero2.yaml
+configs/qwen3/distill/special/qwen3-1_7b_lsq_distill_from_qwen3-4b_zero2.yaml
+configs/qwen3/distill/special/qwen3-1_7b_seq_distill_from_qwen3-4b_zero2.yaml
+configs/qwen3/distill/special/qwen3-1_7b_dlt_distill_from_qwen3-4b_zero2.yaml
+```
+
+Run one method by selecting its config:
+
+```bash
+torchrun --nproc_per_node=8 \
+  tools/run.py \
+  -c configs/qwen3/distill/special/qwen3-1_7b_sherry_distill_from_qwen3-4b_zero2.yaml
+```
+
+Key fields:
+
+```yaml
+plugin_config:
+  enable_scale: true
+  quant_config:
+    use_weight_quant: true
+    use_activation_quant: false
+    weight_quantizer: special
+    special:
+      quant_method: sherry  # sherry, absmean, twn, lsq, seq, or dlt
+      granularity: per_group
+      group_size: 128
+      w_bits: 1
+      N: 3
+      M: 4
+```
+
 ## Experiment Results
 
 The following benchmark compares a Qwen3-1.7B base model with a Qwen3-1.7B full-precision student distilled from a Qwen3-4B teacher. PPL is not included in this table.
