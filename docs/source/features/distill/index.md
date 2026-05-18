@@ -90,7 +90,6 @@ Experiment setting:
 | Reasoning | GSM8K | 0.7991 | 0.7612 | -0.0379 | 1319 |
 | Reasoning | MATH subset | 0.6081 | 0.6040 | -0.0041 | 500 |
 | Reasoning | BBH subset | 0.7000 | 0.8000 | +0.1000 | 250 |
-| Instruction Following | IFEval | generated only | generated only | N/A | 541 |
 
 ## Dataset Format
 
