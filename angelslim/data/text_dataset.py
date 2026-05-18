@@ -50,11 +50,12 @@ class TextDataset(BaseDataset):
         else:
             self._load_jsonl_data(data_path, num_samples)
 
-    def _load_hf_dataset(self, data_path: str, num_samples: int, block_size: int = None):
-        block_size = block_size or self.max_length
-        target_blocks = num_samples if num_samples > 0 else None
+    def _load_hf_dataset(self, data_path: str, num_samples: int, block_size: int = 2048):
         parts = data_path.split(",")
         dataset = load_dataset(*parts)["train"]
+        total_samples = (
+            min(num_samples, len(dataset["text"])) if num_samples > 0 else len(dataset["text"])
+        )
 
         concatenated = {}
         for sample in dataset:
@@ -63,30 +64,21 @@ class TextDataset(BaseDataset):
                 if key not in concatenated:
                     concatenated[key] = []
                 concatenated[key].extend(tokenized[key])
-            if (
-                target_blocks
-                and len(concatenated.get("input_ids", [])) >= target_blocks * block_size
-            ):
-                break
 
         total = len(concatenated["input_ids"])
-        if target_blocks:
-            total = min(total, target_blocks * block_size)
         if total >= block_size:
             total = (total // block_size) * block_size
         result = {
             k: [t[i : i + block_size] for i in range(0, total, block_size)]
             for k, t in concatenated.items()
         }
-        for i in range(len(result["input_ids"])):
+        for i in range(total_samples):
             inputs = {
                 "input_ids": torch.tensor(result["input_ids"][i]).unsqueeze(0).to(self.device)
             }
             # HF CausalLM models shift labels internally; feed labels == input_ids.
             inputs["labels"] = inputs["input_ids"].clone()
-            inputs["attention_mask"] = (
-                torch.tensor(result["attention_mask"][i]).unsqueeze(0).to(self.device)
-            )
+            inputs["attention_mask"] = torch.tensor(result["attention_mask"][i]).to(self.device)
             self.data.append(inputs)
 
     def _load_parquet_data(self, data_path: str, num_samples: int):
@@ -161,6 +153,25 @@ class TextDataset(BaseDataset):
                     full_messages, tokenize=False, add_generation_prompt=False
                 )
 
+                # Legacy branch: thinking-style data without a chat template.
+                thinking_data = any(
+                    m["role"] == "assistant"
+                    and "<think>" in m.get("content", "")
+                    and "</think>" in m.get("content", "")
+                    for m in messages
+                )
+                if thinking_data:
+                    bos = self.processor.bos_token or ""
+                    prompt_text = bos
+                    for m in prompt_messages:
+                        if m["role"] == "system":
+                            prompt_text += m["content"]
+                        elif m["role"] == "user":
+                            prompt_text += "<｜User｜>" + m["content"] + "<｜Assistant｜>"
+                        elif m["role"] == "assistant":
+                            prompt_text += m["content"] + self.processor.eos_token
+                    full_text = prompt_text + assistant_msg["content"] + self.processor.eos_token
+
                 # Token-level prompt length: count tokens in ``prompt_text``
                 # without special-token insertion so it aligns with the
                 # prefix of the tokenization of ``full_text``.
@@ -224,7 +235,7 @@ class TextDataset(BaseDataset):
                 {"role": "assistant", "content": share_gpt_data[1]["value"]},
             ]
             if "system" in data and data["system"]:
-                messages = [{"role": "system", "content": data["system"]}] + messages
+                messages = [{"role": "system", "content": data["system_prompt"]}] + messages
         else:
             messages = [
                 {"role": "user", "content": data["input"]},

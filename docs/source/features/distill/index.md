@@ -16,7 +16,7 @@ AngelSlim Distill trains a student model with a separate full-precision teacher 
 This example distills a Qwen3-1.7B full-precision student from a Qwen3-4B full-precision teacher.
 
 ```bash
-torchrun --nproc_per_node=2 \
+torchrun --nproc_per_node=8 \
   tools/run.py \
   -c configs/qwen3/distill/fp/qwen3-1_7b_fp_distill_from_qwen3-4b_zero2.yaml
 ```
@@ -44,7 +44,7 @@ compression:
 This example distills a W4A8-FP8 Qwen3-4B student from a full-precision Qwen3-4B teacher. The quantized student reuses QAT learnable-scale plugins and trains only quantization parameters.
 
 ```bash
-torchrun --nproc_per_node=2 \
+torchrun --nproc_per_node=8 \
   tools/run.py \
   -c configs/qwen3/distill/w4a8_fp8/qwen3-4b_w4a8_fp8_distill_zero2.yaml
 ```
@@ -64,6 +64,33 @@ compression:
     plugin_config:
       enable_scale: true
 ```
+
+## Experiment Results
+
+The following benchmark compares a Qwen3-1.7B base model with a Qwen3-1.7B full-precision student distilled from a Qwen3-4B teacher. PPL is not included in this table.
+
+Experiment setting:
+
+- Teacher: Qwen3-4B full-precision model.
+- Student: Qwen3-1.7B full-precision model.
+- Training data: Qwen3-4B teacher rollouts generated from public instruction datasets. See `dataset/qwen3_4b_rollout_10k/README.md` for the data construction workflow.
+- Sequence length: `8192`.
+- Global batch size: `32` with 8 GPUs, per-device batch size `1`, and gradient accumulation steps `4`.
+- Loss: CausalLM loss plus CAKLD loss, both with weight `1.0`.
+- Evaluation: generation-based benchmark with vLLM. IFEval generation is reported without the official strict scorer.
+
+| Group | Task | Base | Distilled | Delta | Samples |
+|---|---:|---:|---:|---:|---:|
+| General | PIQA | 0.6638 | 0.7383 | +0.0745 | 1838 |
+| General | ARC Easy | 0.8930 | 0.8912 | -0.0018 | 570 |
+| General | ARC Challenge | 0.7258 | 0.7224 | -0.0034 | 299 |
+| General | HellaSwag | 0.5908 | 0.6257 | +0.0349 | 10042 |
+| General | Winogrande | 0.5446 | 0.5304 | -0.0142 | 1267 |
+| General | MMLU | 0.5291 | 0.5096 | -0.0195 | 14042 |
+| Reasoning | GSM8K | 0.7991 | 0.7612 | -0.0379 | 1319 |
+| Reasoning | MATH subset | 0.6081 | 0.6040 | -0.0041 | 500 |
+| Reasoning | BBH subset | 0.7000 | 0.8000 | +0.1000 | 250 |
+| Instruction Following | IFEval | generated only | generated only | N/A | 541 |
 
 ## Dataset Format
 
