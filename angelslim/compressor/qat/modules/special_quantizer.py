@@ -103,7 +103,11 @@ class SpecialWeightQuantizer(nn.Module):
         self.eps = 0.0
 
         scale_shape = self._scale_shape(weight_shape)
-        self.scale = nn.Parameter(torch.ones(scale_shape, dtype=torch.float32))
+        scale = torch.ones(scale_shape, dtype=torch.float32)
+        if self.quant_method in ("lsq", "seq", "dlt"):
+            self.scale = nn.Parameter(scale)
+        else:
+            self.register_buffer("scale", scale)
         if self.quant_method == "dlt":
             self.gamma = nn.Parameter(torch.zeros(scale_shape, dtype=torch.float32))
         else:

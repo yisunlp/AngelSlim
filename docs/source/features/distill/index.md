@@ -86,6 +86,14 @@ torchrun --nproc_per_node=8 \
   -c configs/qwen3/distill/special/qwen3-1_7b_sherry_distill_from_qwen3-4b_zero2.yaml
 ```
 
+A Hunyuan translation-style 2-bit SEQ distillation demo is also provided:
+
+```text
+configs/hunyuan/distill/special/hunyuan_seq_2bit_distill_zero2.yaml
+```
+
+Replace `model.model_path`, `compression.Distill.teacher_model_path`, and `dataset.data_path` with local model and translation-data paths before running it.
+
 Key fields:
 
 ```yaml
@@ -102,6 +110,21 @@ plugin_config:
       w_bits: 1
       N: 3
       M: 4
+```
+
+For the 2-bit SEQ demo, the special weight quantizer uses per-channel scaling:
+
+```yaml
+plugin_config:
+  enable_scale: true
+  quant_config:
+    use_weight_quant: true
+    use_activation_quant: false
+    weight_quantizer: special
+    special:
+      quant_method: seq
+      granularity: per_channel
+      w_bits: 2
 ```
 
 ## Experiment Results
